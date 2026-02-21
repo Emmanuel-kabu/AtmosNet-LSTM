@@ -1,0 +1,62 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyd
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+*.egg-info/
+build/
+dist/
+
+# Environments
+.venv/
+venv/
+atm_env/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Data & artifacts (tracked via DVC or stored externally)
+data/*
+!data/.gitkeep
+!data/extraction/
+!data/lake/
+data/lake/raw/
+data/lake/clean/
+data/lake/features/
+!data/lake/raw/.gitkeep
+!data/lake/clean/.gitkeep
+!data/lake/features/.gitkeep
+data/manifests/*.json
+!data/manifests/.gitkeep
+artifacts/*
+!artifacts/.gitkeep
+models/*
+!models/.gitkeep
+
+# Notebooks checkpoints
+.ipynb_checkpoints/
+
+# MLflow
+mlruns/
+
+# DVC
+.dvc/cache/
+
+# Coverage
+htmlcov/
+.coverage
+
+# Secrets
+.env
+.env.*
+!.env.example
+
+# SQLite databases
+*.db

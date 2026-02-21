@@ -1,0 +1,21 @@
+# Ignore everything in build context except what we need
+**/__pycache__
+**/.pytest_cache
+**/.ruff_cache
+**/.mypy_cache
+**/.venv
+**/venv
+**/.git
+**/.env
+**/.env.*
+**/node_modules
+**/mlruns
+**/*.pyc
+docker/
+.github/
+tests/
+notebooks/
+*.md
+.gitignore
+.dockerignore
+Makefile

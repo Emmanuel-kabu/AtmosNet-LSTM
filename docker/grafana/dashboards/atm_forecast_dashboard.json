@@ -1,0 +1,307 @@
+{
+  "annotations": {
+    "list": []
+  },
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "id": null,
+  "links": [],
+  "panels": [
+    {
+      "title": "API Overview",
+      "type": "row",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 0 },
+      "collapsed": false
+    },
+    {
+      "title": "Request Rate (req/s)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 1 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "sum(rate(atm_forecast_http_requests_total[5m])) by (endpoint)",
+          "legendFormat": "{{ endpoint }}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps"
+        }
+      }
+    },
+    {
+      "title": "HTTP Latency (p50 / p95 / p99)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 1 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.50, sum(rate(atm_forecast_http_request_duration_seconds_bucket[5m])) by (le))",
+          "legendFormat": "p50"
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(atm_forecast_http_request_duration_seconds_bucket[5m])) by (le))",
+          "legendFormat": "p95"
+        },
+        {
+          "expr": "histogram_quantile(0.99, sum(rate(atm_forecast_http_request_duration_seconds_bucket[5m])) by (le))",
+          "legendFormat": "p99"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        }
+      }
+    },
+    {
+      "title": "HTTP Status Codes",
+      "type": "piechart",
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 1 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "sum(atm_forecast_http_requests_total) by (status_code)",
+          "legendFormat": "{{ status_code }}"
+        }
+      ]
+    },
+    {
+      "title": "Inference Metrics",
+      "type": "row",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 9 },
+      "collapsed": false
+    },
+    {
+      "title": "Prediction Count",
+      "type": "stat",
+      "gridPos": { "h": 6, "w": 6, "x": 0, "y": 10 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "sum(atm_forecast_predictions_total)",
+          "legendFormat": "total"
+        }
+      ]
+    },
+    {
+      "title": "Prediction Success Rate",
+      "type": "gauge",
+      "gridPos": { "h": 6, "w": 6, "x": 6, "y": 10 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "sum(atm_forecast_predictions_total{status=\"success\"}) / sum(atm_forecast_predictions_total) * 100",
+          "legendFormat": "success %"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "min": 0,
+          "max": 100,
+          "thresholds": {
+            "steps": [
+              { "color": "red", "value": 0 },
+              { "color": "yellow", "value": 90 },
+              { "color": "green", "value": 99 }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "title": "Inference Latency (model.predict)",
+      "type": "timeseries",
+      "gridPos": { "h": 6, "w": 12, "x": 12, "y": 10 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.50, sum(rate(atm_forecast_inference_latency_seconds_bucket[5m])) by (le))",
+          "legendFormat": "p50"
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(atm_forecast_inference_latency_seconds_bucket[5m])) by (le))",
+          "legendFormat": "p95"
+        },
+        {
+          "expr": "histogram_quantile(0.99, sum(rate(atm_forecast_inference_latency_seconds_bucket[5m])) by (le))",
+          "legendFormat": "p99"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        }
+      }
+    },
+    {
+      "title": "Preprocessing Latency",
+      "type": "timeseries",
+      "gridPos": { "h": 6, "w": 12, "x": 0, "y": 16 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.50, sum(rate(atm_forecast_preprocessing_latency_seconds_bucket[5m])) by (le))",
+          "legendFormat": "p50"
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(atm_forecast_preprocessing_latency_seconds_bucket[5m])) by (le))",
+          "legendFormat": "p95"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        }
+      }
+    },
+    {
+      "title": "Prediction Value Distribution",
+      "type": "timeseries",
+      "gridPos": { "h": 6, "w": 12, "x": 12, "y": 16 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "atm_forecast_prediction_value_sum / atm_forecast_prediction_value_count",
+          "legendFormat": "mean prediction"
+        }
+      ]
+    },
+    {
+      "title": "Drift & Model Health",
+      "type": "row",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 22 },
+      "collapsed": false
+    },
+    {
+      "title": "Drift Detections",
+      "type": "timeseries",
+      "gridPos": { "h": 6, "w": 12, "x": 0, "y": 23 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "sum(rate(atm_forecast_drift_detected_total[1h])) by (drift_type)",
+          "legendFormat": "{{ drift_type }}"
+        }
+      ]
+    },
+    {
+      "title": "Drift Score by Column",
+      "type": "bargauge",
+      "gridPos": { "h": 6, "w": 12, "x": 12, "y": 23 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "atm_forecast_drift_score",
+          "legendFormat": "{{ drift_type }}: {{ column }}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "steps": [
+              { "color": "green", "value": 0 },
+              { "color": "yellow", "value": 0.3 },
+              { "color": "red", "value": 0.7 }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "title": "Model Loaded",
+      "type": "stat",
+      "gridPos": { "h": 6, "w": 6, "x": 0, "y": 29 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "atm_forecast_model_loaded",
+          "legendFormat": "loaded"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            { "options": { "0": { "text": "NOT LOADED", "color": "red" }, "1": { "text": "LOADED", "color": "green" } }, "type": "value" }
+          ]
+        }
+      }
+    },
+    {
+      "title": "Training Loss (latest)",
+      "type": "stat",
+      "gridPos": { "h": 6, "w": 6, "x": 6, "y": 29 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "atm_forecast_training_loss{split=\"train\"}",
+          "legendFormat": "train"
+        },
+        {
+          "expr": "atm_forecast_training_loss{split=\"val\"}",
+          "legendFormat": "val"
+        }
+      ]
+    },
+    {
+      "title": "Training Metrics",
+      "type": "bargauge",
+      "gridPos": { "h": 6, "w": 12, "x": 12, "y": 29 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "atm_forecast_training_metric",
+          "legendFormat": "{{ metric_name }}"
+        }
+      ]
+    },
+    {
+      "title": "Requests In Progress",
+      "type": "gauge",
+      "gridPos": { "h": 6, "w": 8, "x": 0, "y": 35 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "sum(atm_forecast_http_requests_in_progress)",
+          "legendFormat": "in progress"
+        }
+      ]
+    },
+    {
+      "title": "Monitoring Reports Generated",
+      "type": "stat",
+      "gridPos": { "h": 6, "w": 8, "x": 8, "y": 35 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "sum(atm_forecast_monitoring_reports_total) by (report_type)",
+          "legendFormat": "{{ report_type }}"
+        }
+      ]
+    },
+    {
+      "title": "Training Runs",
+      "type": "stat",
+      "gridPos": { "h": 6, "w": 8, "x": 16, "y": 35 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "sum(atm_forecast_training_runs_total) by (status)",
+          "legendFormat": "{{ status }}"
+        }
+      ]
+    }
+  ],
+  "schemaVersion": 39,
+  "tags": ["atm-forecast", "monitoring"],
+  "templating": { "list": [] },
+  "time": { "from": "now-1h", "to": "now" },
+  "timepicker": {},
+  "timezone": "browser",
+  "title": "ATM Forecast - Monitoring Dashboard",
+  "uid": "atm-forecast-monitoring",
+  "version": 1
+}
