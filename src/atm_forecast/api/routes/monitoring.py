@@ -1,6 +1,7 @@
 """Monitoring & observability endpoints.
 
 Exposes on-demand Evidently drift reports and monitoring health.
+Updated to use the Parquet-based data lake and multi-target system.
 """
 
 from __future__ import annotations
@@ -12,8 +13,13 @@ import numpy as np
 import pandas as pd
 from fastapi import APIRouter, Depends, HTTPException, status
 
-from atm_forecast.api.dependencies import get_model_service
+from atm_forecast.api.dependencies import (
+    DataService,
+    get_data_service,
+    get_model_service,
+)
 from atm_forecast.config import get_settings
+from atm_forecast.data.preprocessing import TARGETS
 from atm_forecast.monitoring.metrics import MONITORING_REPORT_COUNT
 
 logger = logging.getLogger(__name__)
@@ -24,6 +30,7 @@ router = APIRouter(prefix="/api/v1/monitoring", tags=["monitoring"])
 @router.get("/drift", summary="Run data drift report")
 def data_drift_report(
     model_service=Depends(get_model_service),
+    data_svc: DataService = Depends(get_data_service),
 ) -> dict[str, Any]:
     """Generate an Evidently data drift report comparing reference vs recent data."""
     try:
@@ -36,23 +43,25 @@ def data_drift_report(
 
     settings = get_settings()
 
-    # Load reference data
-    data_path = settings.data_dir / "temperature_data.csv"
-    if not data_path.exists():
+    # Load data from the Parquet-based data lake
+    try:
+        df = data_svc.raw_dataframe()
+    except Exception as exc:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Reference data not found at {data_path}",
+            detail=f"Could not load data from lake: {exc}",
         )
 
-    df = pd.read_csv(data_path)
     numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
     if not numeric_cols:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail="No numeric columns found in reference data",
+            detail="No numeric columns found in data lake",
         )
 
-    # Split into reference / current (80/20)
+    # Split into reference / current (80/20 chronological)
+    if "date" in df.columns:
+        df = df.sort_values("date")
     split_idx = int(len(df) * 0.8)
     reference = df[numeric_cols].iloc[:split_idx]
     current = df[numeric_cols].iloc[split_idx:]
@@ -70,6 +79,7 @@ def data_drift_report(
 @router.get("/performance", summary="Run model performance report")
 def model_performance_report(
     model_service=Depends(get_model_service),
+    data_svc: DataService = Depends(get_data_service),
 ) -> dict[str, Any]:
     """Generate an Evidently regression performance report."""
     try:
@@ -84,22 +94,32 @@ def model_performance_report(
 
     settings = get_settings()
 
-    data_path = settings.data_dir / "temperature_data.csv"
-    if not data_path.exists():
+    try:
+        df = data_svc.raw_dataframe()
+    except Exception as exc:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Reference data not found at {data_path}",
+            detail=f"Could not load data from lake: {exc}",
         )
 
-    df = pd.read_csv(data_path)
-    target_col = "meantemp" if "meantemp" in df.columns else df.columns[-1]
+    # Use first available target column
+    target_col = None
+    for tgt in TARGETS:
+        if tgt in df.columns:
+            target_col = tgt
+            break
+    if target_col is None:
+        target_col = df.select_dtypes(include=[np.number]).columns[-1]
+
     numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
 
+    if "date" in df.columns:
+        df = df.sort_values("date")
     split_idx = int(len(df) * 0.8)
     reference = df[numeric_cols].iloc[:split_idx].copy()
     current = df[numeric_cols].iloc[split_idx:].copy()
 
-    # Add dummy predictions column (simple persistence baseline) for demonstration
+    # Add dummy predictions column (persistence baseline) for demonstration
     reference["prediction"] = reference[target_col].shift(1).bfill()
     current["prediction"] = current[target_col].shift(1).bfill()
 

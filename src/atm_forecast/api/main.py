@@ -10,6 +10,7 @@ from atm_forecast.api.middleware import PrometheusMiddleware
 from atm_forecast.api.routes.health import router as health_router
 from atm_forecast.api.routes.monitoring import router as monitoring_router
 from atm_forecast.api.routes.predictions import router as predictions_router
+from atm_forecast.api.routes.data import router as data_router
 from atm_forecast.config import get_settings
 from atm_forecast.monitoring.metrics import setup_metrics
 from atm_forecast.utils.logging import setup_logging
@@ -41,6 +42,7 @@ def create_app() -> FastAPI:
     # ── Routers ──────────────────────────────────────────────────────
     app.include_router(health_router)
     app.include_router(predictions_router)
+    app.include_router(data_router)
     app.include_router(monitoring_router)
 
     # ── Prometheus /metrics endpoint ─────────────────────────────────

@@ -13,12 +13,17 @@ from atm_forecast.data.pipeline import (
 )
 from atm_forecast.data.pipeline_state import get_watermark, update_watermark
 from atm_forecast.data.preprocessing import (
+    PreprocessingPipeline,
     create_sequences,
     prepare_pipeline,
+    run_preprocessing,
     split_data,
+    TARGETS,
 )
 
 __all__ = [
+    "PreprocessingPipeline",
+    "TARGETS",
     "create_sequences",
     "get_watermark",
     "ingest_raw",
@@ -27,6 +32,7 @@ __all__ = [
     "prepare_pipeline",
     "read_all_partitions",
     "read_partition",
+    "run_preprocessing",
     "split_data",
     "transform_clean",
     "transform_features",

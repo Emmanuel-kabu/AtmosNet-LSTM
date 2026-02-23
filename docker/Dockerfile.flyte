@@ -1,0 +1,42 @@
+# ── Flyte Task Image ─────────────────────────────────────────────────
+# This image is used by Flyte to run ML pipeline tasks (preprocessing,
+# feature engineering, training, evaluation, deployment).
+#
+# It is SEPARATE from the API Dockerfile — this one includes the full
+# ML stack (TensorFlow, MLflow, etc.) while the API image is lightweight.
+#
+# Build & push:
+#   docker build -f docker/Dockerfile.flyte -t ghcr.io/emmanuelkabu/atm-forecast-flyte:latest .
+#   docker push ghcr.io/emmanuelkabu/atm-forecast-flyte:latest
+# ─────────────────────────────────────────────────────────────────────
+
+FROM python:3.11-slim AS builder
+
+WORKDIR /build
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends gcc g++ && \
+    rm -rf /var/lib/apt/lists/*
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir --prefix=/install -r requirements.txt
+RUN pip install --no-cache-dir --prefix=/install flytekit>=1.14
+
+# ── Runtime ──────────────────────────────────────────────────────────
+FROM python:3.11-slim
+
+WORKDIR /app
+
+COPY --from=builder /install /usr/local
+
+# Copy project source
+COPY pyproject.toml .
+COPY src/ src/
+
+# Install the package (deps already installed above)
+RUN pip install --no-cache-dir --no-deps -e .
+
+# Create runtime directories
+RUN mkdir -p /app/models /app/data /app/artifacts
+
+# Flyte uses pyflyte as entrypoint — no CMD needed

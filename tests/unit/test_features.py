@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pandas as pd
 
-from atm_forecast.features.engineering import (
+from atm_forecast.features.feature_engineering import (
     add_cyclical_time_features,
     add_lag_features,
     add_rolling_features,

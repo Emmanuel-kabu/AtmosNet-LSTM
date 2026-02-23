@@ -1,99 +1,153 @@
-"""End-to-end training pipeline.
+"""
+End-to-end Training Pipeline — AtmosNet
+========================================
 
-Supports two data modes:
+Orchestrates the full workflow:
 
-1. **Legacy** — pass a CSV/Parquet path via ``data_path``.
-2. **Data-lake** — read pre-engineered features from
-   ``data/lake/features/`` by setting ``use_lake=True``.  Features are
-   already computed, so the pipeline skips feature engineering and goes
-   straight to split → scale → sequence → train.
+1. Load raw data from the data lake (``data/lake/raw/``)
+2. Preprocess (clean, clip, fill NaN)
+3. Feature engineering (lags, rolling, cyclical, interactions, …)
+4. Target transforms + scaling (fit on train split only)
+5. Sequence creation (sliding window)
+6. Build & train three models (Bi-LSTM, TCN, TFT)
+7. Evaluate on the test split
+8. Log everything to **MLflow** (params, per-target metrics, datasets,
+   models, artefacts)
+9. Log to **W&B** — gradient/weight monitoring via ``wandb.watch``,
+   per-epoch metrics, prediction tables, and model artefacts
+10. Persist pipeline artefacts & trained models to disk
+
+Data modes
+----------
+* **Data-lake** (default) — reads ``data/lake/raw/``, runs full
+  preprocessing + feature engineering.
+* **Legacy** — pass ``data_path`` to a CSV/Parquet file.
 """
 
 from __future__ import annotations
 
 import logging
+import time
 from pathlib import Path
+from typing import Dict, List, Literal
 
 import numpy as np
 import pandas as pd
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau
 
 from atm_forecast.config import get_settings
-from atm_forecast.data.ingestion import load_data
-from atm_forecast.data.preprocessing import create_sequences, prepare_pipeline, split_data
-from atm_forecast.features.engineering import (
-    add_cyclical_time_features,
-    add_lag_features,
-    add_rolling_features,
+from atm_forecast.data.preprocessing import (
+    PreprocessingPipeline,
+    create_sequences,
+    split_data,
+    TARGETS,
 )
-from atm_forecast.models.lstm import build_lstm_model
+from atm_forecast.features.feature_engineering import run_feature_engineering
+from atm_forecast.models.Model_initialiazatin import build_model
 from atm_forecast.models.registry import save_model
+from atm_forecast.monitoring.mlflow_tracker import MLflowTracker
 from atm_forecast.monitoring.wandb_tracker import (
     finish_wandb,
     init_wandb,
     log_artifact,
-    log_metrics,
+    log_metrics as wandb_log_metrics,
     log_model_summary,
     log_predictions,
-    log_training_history,
+    log_training_history as wandb_log_history,
 )
-from atm_forecast.monitoring.evidently_monitor import (
-    generate_data_drift_report,
-    generate_model_performance_report,
-)
-from atm_forecast.training.evaluate import evaluate_model
 
 logger = logging.getLogger(__name__)
 
 
-# ── Helpers ───────────────────────────────────────────────────────────────
+# ── Evaluation helper ─────────────────────────────────────────────────
 
-def _load_lake_features(settings) -> pd.DataFrame:
-    """Load the full features layer from the data lake."""
-    from atm_forecast.data.lake import read_all_partitions, LAYER_FEATURES
+def evaluate_on_test(
+    model,
+    X_test: np.ndarray,
+    y_test: np.ndarray,
+    pipeline: PreprocessingPipeline,
+    targets: List[str],
+) -> Dict[str, Dict[str, float]]:
+    """Evaluate a trained model on the test split.
 
-    lake_root = settings.lake_root
-    logger.info("Loading features from data lake at %s", lake_root)
-    return read_all_partitions(lake_root, LAYER_FEATURES)
+    Returns per-target metrics dict:
+    ``{target: {MAE, RMSE, R2}}`` in original-scale units.
+    """
+    preds = model.predict(X_test, verbose=0)
+    preds_inv = pipeline.inverse_transform_targets(preds)
+    trues_inv = pipeline.inverse_transform_targets(y_test)
 
+    metrics: Dict[str, Dict[str, float]] = {}
+    for i, t in enumerate(targets):
+        mae = float(mean_absolute_error(trues_inv[:, i], preds_inv[:, i]))
+        rmse = float(np.sqrt(mean_squared_error(trues_inv[:, i], preds_inv[:, i])))
+        r2 = float(r2_score(trues_inv[:, i], preds_inv[:, i]))
+        metrics[t] = {"MAE": mae, "RMSE": rmse, "R2": r2}
+    return metrics
+
+
+# ── Main entry-point ──────────────────────────────────────────────────
 
 def run_training(
     data_path: str | None = None,
-    target_column: str = "temperature",
     output_dir: str | None = None,
     *,
-    use_lake: bool = False,
+    models_to_train: List[Literal["bilstm", "tcn", "tft"]] | None = None,
+    use_lake: bool = True,
+    mlflow_experiment: str = "atm-forecast",
+    mlflow_tracking_uri: str = "mlruns",
     **overrides,
 ) -> Path:
-    """Execute the full training pipeline.
+    """Execute the full training pipeline for all models.
 
     Parameters
     ----------
     data_path : str | None
-        Path to a raw CSV/Parquet file.  Ignored when *use_lake* is True.
-    target_column : str
-        Name of the column to forecast.
+        Path to raw CSV/Parquet.  Ignored when ``use_lake=True``.
     output_dir : str | None
-        Where to save artefacts.  Falls back to ``settings.model_dir``.
+        Where to save artefacts.  Falls back to ``settings.artifacts_dir``.
+    models_to_train : list[str]
+        Which models to train.  Default: all three.
     use_lake : bool
-        If *True*, load pre-engineered features from the data lake
-        (``data/lake/features/``) and skip the feature-engineering step.
+        If True, load from ``data/lake/raw/``.
+    mlflow_experiment / mlflow_tracking_uri : str
+        MLflow configuration.
     **overrides
-        Any ``Settings`` fields to override (e.g. ``epochs=100``).
+        Override ``Settings`` fields (e.g. ``epochs=100``).
 
     Returns
     -------
     Path
-        Directory where the trained model was saved.
+        Artefacts output directory.
     """
     settings = get_settings()
+    seq_len = overrides.get("sequence_length", settings.sequence_length)
+    forecast_h = overrides.get("forecast_horizon", settings.forecast_horizon)
     epochs = overrides.get("epochs", settings.epochs)
     batch_size = overrides.get("batch_size", settings.batch_size)
-    seq_len = overrides.get("sequence_length", settings.sequence_length)
-    horizon = overrides.get("forecast_horizon", settings.forecast_horizon)
-    out = Path(output_dir) if output_dir else settings.model_dir
+    lr = overrides.get("learning_rate", settings.learning_rate)
+    out_dir = Path(output_dir) if output_dir else settings.artifacts_dir
 
-    # ── W&B initialisation ───────────────────────────────────────────
+    if models_to_train is None:
+        models_to_train = ["bilstm", "tcn", "tft"]
+
+    targets = TARGETS
+
+    # ── 1. Initialise MLflow tracker ─────────────────────────────
+    tracker = MLflowTracker(
+        experiment_name=mlflow_experiment,
+        tracking_uri=mlflow_tracking_uri,
+    )
+    tracker.start_run(
+        run_name=f"train-{'_'.join(models_to_train)}",
+        tags={
+            "models": ",".join(models_to_train),
+            "data_source": "lake" if use_lake else "file",
+        },
+    )
+
+    # ── 1b. Initialise W&B (weight & gradient monitoring) ────────
     wandb_run = None
     if settings.wandb_enabled:
         wandb_run = init_wandb(
@@ -102,204 +156,272 @@ def run_training(
                 "epochs": epochs,
                 "batch_size": batch_size,
                 "sequence_length": seq_len,
-                "forecast_horizon": horizon,
-                "lstm_units": settings.lstm_units,
-                "dropout_rate": settings.dropout_rate,
-                "learning_rate": settings.learning_rate,
-                "target_column": target_column,
-                "data_path": data_path,
+                "forecast_horizon": forecast_h,
+                "learning_rate": lr,
+                "models": models_to_train,
+                "n_targets": len(targets),
             },
-            run_name=f"train-{target_column}-ep{epochs}",
-            tags=["training", target_column] + (["lake"] if use_lake else []),
+            run_name=f"train-{'_'.join(models_to_train)}-ep{epochs}",
+            tags=["training", "multi-target"]
+            + (["lake"] if use_lake else [])
+            + models_to_train,
         )
 
     try:
-        # 1. Load data — either from the lake or a raw file ───────────
+        # ── 2. Load & preprocess ─────────────────────────────────
+        pipeline = PreprocessingPipeline(targets=targets)
+
         if use_lake:
-            logger.info("Loading pre-engineered features from data lake")
-            df = _load_lake_features(settings)
-            if target_column not in df.columns:
-                raise KeyError(
-                    f"Target column {target_column!r} not in lake features: "
-                    f"{list(df.columns)}"
-                )
-            # Lake features already include lags/rolling/cyclical → skip FE
+            raw_dir = settings.lake_root / "raw"
+            logger.info("Loading data lake from %s", raw_dir)
+            df = pipeline.load_raw(raw_dir)
         else:
             if data_path is None:
-                raise ValueError(
-                    "data_path is required when use_lake=False"
-                )
+                raise ValueError("data_path required when use_lake=False")
             logger.info("Loading data from %s", data_path)
-            df = load_data(data_path)
-
-            # 2. Feature engineering (only in legacy mode)
-            logger.info("Engineering features")
-            df = add_lag_features(
-                df, columns=[target_column], lags=[1, 2, 3, 6, 12, 24]
+            df = (
+                pd.read_parquet(data_path)
+                if str(data_path).endswith(".parquet")
+                else pd.read_csv(data_path)
             )
-            df = add_rolling_features(
-                df, columns=[target_column], windows=[6, 12, 24]
-            )
-            try:
-                df = add_cyclical_time_features(df)
-            except TypeError:
-                logger.warning(
-                    "Index is not DatetimeIndex — skipping cyclical features"
-                )
-            df = df.dropna()
 
-        # 3. Split data
-        train_df, val_df, test_df = split_data(
-            df, test_ratio=settings.test_split, val_ratio=settings.validation_split
+        df = pipeline.clean(df)
+
+        # ── 3. Feature engineering ───────────────────────────────
+        df = run_feature_engineering(df, targets=targets)
+
+        # ── 4. Target transforms + scaling (fit on train) ────────
+        train_raw, val_raw, test_raw = split_data(df)
+
+        # Fit transforms & scalers on TRAIN only
+        train_transformed = pipeline.fit_transform_targets(train_raw)
+        train_scaled, feature_cols = pipeline.fit_scalers(train_transformed)
+
+        # Apply same transform to val & test
+        val_scaled = pipeline.transform(val_raw)
+        test_scaled = pipeline.transform(test_raw)
+
+        # Save pipeline artefacts
+        pipeline.save(out_dir / "preprocessing")
+
+        # Log dataset to MLflow
+        tracker.log_dataset(train_scaled, name="train_features", context="training")
+        tracker.log_dataset(test_scaled, name="test_features", context="testing")
+        tracker.log_artifacts_dir(
+            str(out_dir / "preprocessing"), artifact_path="preprocessing",
         )
 
-        # ── Evidently: baseline data drift between train and val ─────
-        logger.info("Running Evidently data drift report (train vs val)")
-        drift_report = generate_data_drift_report(
-            reference=train_df,
-            current=val_df,
-            output_path=settings.artifacts_dir / "reports" / "train_val_data_drift.html",
+        # ── 5. Sequence creation ─────────────────────────────────
+        X_train, y_train = create_sequences(
+            train_scaled, seq_len, forecast_h, feature_cols, targets,
+        )
+        X_val, y_val = create_sequences(
+            val_scaled, seq_len, forecast_h, feature_cols, targets,
+        )
+        X_test, y_test = create_sequences(
+            test_scaled, seq_len, forecast_h, feature_cols, targets,
         )
 
-        # 4. Scale
-        pipeline = prepare_pipeline(scaler_type="minmax")
-
-        feature_cols = list(train_df.columns)
-        target_idx = feature_cols.index(target_column)
-
-        train_scaled = pipeline.fit_transform(train_df[feature_cols].values)
-        val_scaled = pipeline.transform(val_df[feature_cols].values)
-        test_scaled = pipeline.transform(test_df[feature_cols].values)
-
-        # 5. Create sequences
-        X_train, y_train = create_sequences(train_scaled, seq_len, horizon, target_idx)
-        X_val, y_val = create_sequences(val_scaled, seq_len, horizon, target_idx)
-        X_test, y_test = create_sequences(test_scaled, seq_len, horizon, target_idx)
+        n_features = X_train.shape[2]
+        n_targets = y_train.shape[1]
 
         logger.info(
-            "Sequence shapes — X_train: %s, X_val: %s, X_test: %s",
-            X_train.shape,
-            X_val.shape,
-            X_test.shape,
+            "Sequences — train: %s, val: %s, test: %s",
+            X_train.shape, X_val.shape, X_test.shape,
         )
 
+        # Log common hyper-parameters
+        tracker.log_params({
+            "seq_len": seq_len,
+            "forecast_horizon": forecast_h,
+            "epochs": epochs,
+            "batch_size": batch_size,
+            "learning_rate": lr,
+            "n_features": n_features,
+            "n_targets": n_targets,
+            "train_samples": len(X_train),
+            "val_samples": len(X_val),
+            "test_samples": len(X_test),
+            "targets": targets,
+            "transforms": pipeline.transforms_applied,
+        })
+
+        # Log data stats to W&B
         if settings.wandb_enabled:
-            log_metrics({
+            wandb_log_metrics({
                 "data/train_samples": len(X_train),
                 "data/val_samples": len(X_val),
                 "data/test_samples": len(X_test),
-                "data/n_features": X_train.shape[2],
+                "data/n_features": n_features,
+                "data/n_targets": n_targets,
             })
 
-        # 6. Build model
-        model = build_lstm_model(
-            input_shape=(seq_len, X_train.shape[2]),
-            lstm_units=settings.lstm_units,
-            dropout_rate=settings.dropout_rate,
-            learning_rate=settings.learning_rate,
-            forecast_horizon=horizon,
-        )
-
-        if settings.wandb_enabled:
-            log_model_summary(model)
-
-        # 7. Train
-        callbacks = [
+        # ── 6. Train each model ──────────────────────────────────
+        callbacks_factory = lambda: [
             EarlyStopping(
-                monitor="val_loss",
-                patience=10,
-                restore_best_weights=True,
-                verbose=1,
+                monitor="val_loss", patience=8,
+                restore_best_weights=True, verbose=1,
             ),
             ReduceLROnPlateau(
-                monitor="val_loss",
-                factor=0.5,
-                patience=5,
-                min_lr=1e-6,
-                verbose=1,
+                monitor="val_loss", patience=3,
+                factor=0.5, min_lr=1e-6, verbose=1,
             ),
         ]
 
-        # Add W&B callback if available
-        if settings.wandb_enabled:
-            try:
-                from wandb.integration.keras import WandbMetricsLogger
-                callbacks.append(WandbMetricsLogger(log_freq="epoch"))
-            except ImportError:
-                logger.debug("WandbMetricsLogger not available, using manual logging")
+        all_results: Dict[str, Dict] = {}
 
-        logger.info("Starting training — epochs=%d, batch_size=%d", epochs, batch_size)
-        history = model.fit(
-            X_train,
-            y_train,
-            validation_data=(X_val, y_val),
-            epochs=epochs,
-            batch_size=batch_size,
-            callbacks=callbacks,
-            verbose=1,
-        )
+        for model_name in models_to_train:
+            logger.info("=" * 60)
+            logger.info("Training model: %s", model_name.upper())
+            logger.info("=" * 60)
 
-        # Log training history to W&B
-        if settings.wandb_enabled:
-            log_training_history(history)
-
-        # 8. Evaluate
-        metrics = evaluate_model(model, X_test, y_test, pipeline, target_idx)
-
-        if settings.wandb_enabled:
-            log_metrics(metrics)
-
-            # Log prediction vs actual table
-            y_pred_test = model.predict(X_test, verbose=0).flatten()
-            log_predictions(y_test, y_pred_test, table_name="test_predictions")
-
-        # ── Evidently: model performance on test set ─────────────────
-        logger.info("Running Evidently model performance report")
-        y_pred_all = model.predict(X_test, verbose=0).flatten()
-        perf_df = pd.DataFrame({
-            "target": y_test.flatten(),
-            "prediction": y_pred_all,
-        })
-        # Use train predictions as reference
-        y_pred_train = model.predict(X_train, verbose=0).flatten()
-        ref_df = pd.DataFrame({
-            "target": y_train.flatten(),
-            "prediction": y_pred_train,
-        })
-        generate_model_performance_report(
-            reference=ref_df,
-            current=perf_df,
-            target_column="target",
-            prediction_column="prediction",
-            output_path=settings.artifacts_dir / "reports" / "model_performance.html",
-        )
-
-        # 9. Save
-        metadata = {
-            "target_column": target_column,
-            "sequence_length": seq_len,
-            "forecast_horizon": horizon,
-            "feature_columns": feature_cols,
-            "epochs_trained": len(history.history["loss"]),
-            "final_train_loss": float(history.history["loss"][-1]),
-            "final_val_loss": float(history.history["val_loss"][-1]),
-            **metrics,
-        }
-
-        save_dir = save_model(model, out, scaler=pipeline, metadata=metadata)
-        logger.info("Training complete — artefacts saved to %s", save_dir)
-
-        # Log model artefact to W&B
-        if settings.wandb_enabled:
-            log_artifact(
-                filepath=str(save_dir / "model.keras"),
-                name="lstm-forecast-model",
-                artifact_type="model",
+            model = build_model(
+                model_name, seq_len, n_features, n_targets,
+                learning_rate=lr,
             )
 
-        return save_dir
+            # W&B: watch weights, biases, and gradients
+            if settings.wandb_enabled:
+                log_model_summary(model)
+
+            # Build callbacks — include WandbMetricsLogger if available
+            cbs = callbacks_factory()
+            if settings.wandb_enabled:
+                try:
+                    from wandb.integration.keras import WandbMetricsLogger
+                    cbs.append(WandbMetricsLogger(log_freq="epoch"))
+                except ImportError:
+                    logger.debug(
+                        "WandbMetricsLogger not available — using manual logging"
+                    )
+
+            t0 = time.time()
+            history = model.fit(
+                X_train, y_train,
+                validation_data=(X_val, y_val),
+                epochs=epochs,
+                batch_size=batch_size,
+                callbacks=cbs,
+                verbose=1,
+            )
+            train_time = time.time() - t0
+
+            # Evaluate
+            metrics = evaluate_on_test(model, X_test, y_test, pipeline, targets)
+
+            # Compute summary
+            avg_r2 = float(np.mean([m["R2"] for m in metrics.values()]))
+            avg_mae = float(np.mean([m["MAE"] for m in metrics.values()]))
+            avg_rmse = float(np.mean([m["RMSE"] for m in metrics.values()]))
+
+            # Log to MLflow
+            tracker.log_per_target_metrics(model_name, metrics)
+            tracker.log_metrics({
+                f"{model_name}/avg_R2": avg_r2,
+                f"{model_name}/avg_MAE": avg_mae,
+                f"{model_name}/avg_RMSE": avg_rmse,
+                f"{model_name}/train_time_s": train_time,
+                f"{model_name}/epochs_trained": len(history.history["loss"]),
+                f"{model_name}/best_val_loss": float(
+                    min(history.history["val_loss"])
+                ),
+            })
+            tracker.log_training_history(history, prefix=f"{model_name}/")
+            tracker.log_model(model, model_name, X_sample=X_train, register=True)
+
+            # ── W&B: log metrics, history, predictions, artefact ─
+            if settings.wandb_enabled:
+                wandb_log_metrics({
+                    f"{model_name}/avg_R2": avg_r2,
+                    f"{model_name}/avg_MAE": avg_mae,
+                    f"{model_name}/avg_RMSE": avg_rmse,
+                    f"{model_name}/train_time_s": train_time,
+                    f"{model_name}/epochs_trained": len(history.history["loss"]),
+                    f"{model_name}/best_val_loss": float(
+                        min(history.history["val_loss"])
+                    ),
+                })
+                # Per-target metrics to W&B
+                for tgt, vals in metrics.items():
+                    for metric_key, metric_val in vals.items():
+                        short = tgt.replace("air_quality_", "")
+                        wandb_log_metrics(
+                            {f"{model_name}/{short}/{metric_key}": metric_val}
+                        )
+                wandb_log_history(history)
+                # Prediction table (subset)
+                preds_test = model.predict(X_test, verbose=0)
+                preds_inv = pipeline.inverse_transform_targets(preds_test)
+                trues_inv = pipeline.inverse_transform_targets(y_test)
+                log_predictions(
+                    trues_inv[:, 0], preds_inv[:, 0],
+                    table_name=f"{model_name}_predictions",
+                )
+
+            # Save model to disk
+            model_out = out_dir / "models" / model_name
+            save_model(
+                model, model_out,
+                metadata={
+                    "model_name": model_name,
+                    "targets": targets,
+                    "feature_cols": feature_cols,
+                    "seq_len": seq_len,
+                    "forecast_horizon": forecast_h,
+                    "avg_r2": avg_r2,
+                    "avg_mae": avg_mae,
+                    "avg_rmse": avg_rmse,
+                    "train_time_s": train_time,
+                    "per_target": metrics,
+                },
+            )
+
+            all_results[model_name] = {
+                "model": model,
+                "history": history,
+                "metrics": metrics,
+                "avg_r2": avg_r2,
+                "train_time": train_time,
+            }
+
+            logger.info(
+                "%s done — avg R²=%.4f, avg MAE=%.4f, time=%.1fs",
+                model_name.upper(), avg_r2, avg_mae, train_time,
+            )
+
+        # ── 7. Summary ───────────────────────────────────────────
+        logger.info("=" * 60)
+        logger.info("TRAINING COMPLETE — SUMMARY")
+        logger.info("=" * 60)
+        best_model = max(all_results, key=lambda k: all_results[k]["avg_r2"])
+        for name, res in all_results.items():
+            marker = " *" if name == best_model else ""
+            logger.info(
+                "  %-8s  avg R2=%.4f  time=%.1fs%s",
+                name, res["avg_r2"], res["train_time"], marker,
+            )
+
+        tracker.log_metrics(
+            {"best_model_avg_r2": all_results[best_model]["avg_r2"]}
+        )
+        tracker.log_params({"best_model": best_model})
+
+        # Log best model artefact to W&B
+        if settings.wandb_enabled:
+            best_dir = out_dir / "models" / best_model / "model.keras"
+            if best_dir.exists():
+                log_artifact(
+                    filepath=str(best_dir),
+                    name=f"{best_model}-best-model",
+                    artifact_type="model",
+                )
+            wandb_log_metrics(
+                {"best_model_avg_r2": all_results[best_model]["avg_r2"]}
+            )
+
+        return out_dir
 
     finally:
-        # Always finish the W&B run
+        tracker.end_run()
         if settings.wandb_enabled:
             finish_wandb()

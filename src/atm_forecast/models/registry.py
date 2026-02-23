@@ -8,7 +8,21 @@ import logging
 from datetime import datetime, timezone
 from pathlib import Path
 from tensorflow import keras
+
+from atm_forecast.models.Model_initialiazatin import (
+    CausalConv1DBlock,
+    GatedLinearUnit,
+    GatedResidualNetwork,
+)
+
 logger = logging.getLogger(__name__)
+
+# Custom objects required for keras.models.load_model()
+CUSTOM_OBJECTS = {
+    "CausalConv1DBlock": CausalConv1DBlock,
+    "GatedLinearUnit": GatedLinearUnit,
+    "GatedResidualNetwork": GatedResidualNetwork,
+}
 
 
 def save_model(
@@ -85,7 +99,10 @@ def load_model(
     """
     model_dir = Path(model_dir)
 
-    model = keras.models.load_model(model_dir / "model.keras")
+    model = keras.models.load_model(
+        model_dir / "model.keras",
+        custom_objects=CUSTOM_OBJECTS,
+    )
     logger.info("Loaded model from %s", model_dir)
 
     scaler = None

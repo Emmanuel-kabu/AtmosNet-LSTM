@@ -2,9 +2,9 @@
 
 Three stages mirror the lake layers:
 
-    raw      – ingest from CSV / API, write immutable Parquet partitions
-    clean    – types, missing values, dedup
-    features – lags, rolling stats, cyclical time encodings
+    raw       ingest from CSV / API, write immutable Parquet partitions
+    clean     types, missing values, dedup
+    features  lags, rolling stats, cyclical time encodings
 
 Each stage is watermark-aware and only processes *new* partitions.
 """
@@ -36,7 +36,7 @@ from atm_forecast.data.pipeline_state import (
     get_watermark,
     update_watermark,
 )
-from atm_forecast.features.engineering import (
+from atm_forecast.features.feature_engineering import (
     add_cyclical_time_features,
     add_lag_features,
     add_rolling_features,
@@ -45,9 +45,8 @@ from atm_forecast.features.engineering import (
 logger = logging.getLogger(__name__)
 
 
-# ═══════════════════════════════════════════════════════════════════════════
+
 # STAGE 1 — Ingest raw data
-# ═══════════════════════════════════════════════════════════════════════════
 
 def ingest_raw(
     source_csv: str | Path,
@@ -166,7 +165,7 @@ def transform_clean(
     for d in dates:
         logger.info("Cleaning partition date=%s", d)
         df = read_partition(lake_root, LAYER_RAW, d)
-        df = _clean_dataframe(df)
+        df = clean_dataframe(df)
         out = write_partition(df, lake_root, LAYER_CLEAN, d, overwrite=True)
         manifest.add_partition(d, LAYER_CLEAN, len(df), out)
         processed.append(d)
@@ -177,7 +176,7 @@ def transform_clean(
     return processed
 
 
-def _clean_dataframe(df: pd.DataFrame) -> pd.DataFrame:
+def clean_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     """Standard cleaning: cast types, drop duplicates, handle missing."""
     # 1. Drop full-row duplicates
     before = len(df)
