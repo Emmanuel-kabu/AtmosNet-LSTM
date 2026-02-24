@@ -125,4 +125,3 @@ omit = ["*/tests/*", "*/__main__.py"]
 show_missing = true
 skip_empty = true
 fail_under = 60
-"
