@@ -35,7 +35,7 @@ logger = logging.getLogger(__name__)
 
 try:
     import mlflow
-    import mlflow.tensorflow
+    import mlflow.keras
     from mlflow.models.signature import infer_signature
 
     MLFLOW_AVAILABLE = True
@@ -52,13 +52,13 @@ class MLflowTracker:
     experiment_name : str
         Name of the MLflow experiment (auto-created if missing).
     tracking_uri : str
-        MLflow tracking server URI.  Defaults to a local ``mlruns/`` folder.
+        MLflow tracking server URI.  Defaults to ``sqlite:///mlflow.db``.
     """
 
     def __init__(
         self,
         experiment_name: str = "atm-forecast",
-        tracking_uri: str = "mlruns",
+        tracking_uri: str = "http://localhost:5000",
     ):
         self.experiment_name = experiment_name
         self.tracking_uri = tracking_uri
@@ -235,7 +235,7 @@ class MLflowTracker:
                 logger.warning("Could not infer model signature", exc_info=True)
 
         registered_name = name if register else None
-        mlflow.tensorflow.log_model(
+        mlflow.keras.log_model(
             model,
             artifact_path=name,
             signature=signature,

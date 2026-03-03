@@ -152,6 +152,47 @@ def _load_model_metadata(model_dir: Path) -> dict:
     return {}
 
 
+def _filter_engineered_by_location(
+    df_clean: pd.DataFrame,
+    df_engineered: pd.DataFrame,
+    country: str = "All",
+    location: str = "All",
+) -> pd.DataFrame:
+    """Filter the engineered DataFrame by country / location.
+
+    Uses the ``location_id`` column that was assigned alphabetically
+    from ``location_name`` during feature engineering.
+    """
+    if country == "All" and location == "All":
+        return df_engineered
+
+    if "location_id" not in df_engineered.columns:
+        return df_engineered  # no location encoding available
+
+    # Reconstruct location_name → location_id mapping (alphabetical)
+    if "location_name" not in df_clean.columns:
+        return df_engineered
+
+    location_names_sorted = sorted(df_clean["location_name"].unique())
+    name_to_id = {name: idx for idx, name in enumerate(location_names_sorted)}
+
+    if location != "All":
+        loc_id = name_to_id.get(location)
+        if loc_id is not None:
+            return df_engineered[df_engineered["location_id"] == loc_id].copy()
+        return df_engineered  # location not found, return all
+
+    if country != "All" and "country" in df_clean.columns:
+        country_locs = df_clean.loc[
+            df_clean["country"] == country, "location_name"
+        ].unique()
+        loc_ids = [name_to_id[loc] for loc in country_locs if loc in name_to_id]
+        if loc_ids:
+            return df_engineered[df_engineered["location_id"].isin(loc_ids)].copy()
+
+    return df_engineered
+
+
 def _run_forecast(
     model,
     pipeline,
@@ -297,14 +338,36 @@ class StreamlitFrontend:
         st.markdown(
             """
             <style>
-            /* Tighter metric cards */
+            /* Metric cards with subtle gradient border */
             [data-testid="stMetric"] {
-                background: rgba(28, 131, 225, 0.05);
-                border-radius: 8px;
-                padding: 12px 16px;
+                background: linear-gradient(135deg, rgba(28, 131, 225, 0.06), rgba(28, 225, 131, 0.04));
+                border-radius: 10px;
+                padding: 14px 18px;
+                border-left: 3px solid rgba(28, 131, 225, 0.4);
+                transition: transform 0.2s ease, box-shadow 0.2s ease;
             }
-            /* Remove default padding around charts */
-            .stPlotlyChart { margin-top: -1rem; }
+            [data-testid="stMetric"]:hover {
+                transform: translateY(-2px);
+                box-shadow: 0 4px 12px rgba(0,0,0,0.08);
+            }
+            /* Tighter chart spacing */
+            .stPlotlyChart { margin-top: -0.5rem; }
+            /* Tab labels */
+            .stTabs [data-baseweb="tab-list"] button {
+                font-weight: 600;
+                font-size: 0.95rem;
+            }
+            /* Expander headers */
+            .streamlit-expanderHeader { font-weight: 600; }
+            /* Color-coded badge for location chips */
+            .loc-badge {
+                display: inline-block;
+                padding: 2px 10px;
+                border-radius: 12px;
+                font-size: 0.8rem;
+                font-weight: 500;
+                margin: 2px;
+            }
             </style>
             """,
             unsafe_allow_html=True,
@@ -316,7 +379,7 @@ class StreamlitFrontend:
 
     def page_forecast(self):
         st.header("\U0001F4C8 Forecast")
-        st.markdown("Select targets, location, and time horizon to generate forecasts.")
+        st.markdown("Select targets, locations, and time horizon to generate and compare forecasts.")
 
         model_dir = st.session_state.get("model_dir")
         if model_dir is None:
@@ -342,7 +405,7 @@ class StreamlitFrontend:
             st.info("Please select at least one target.")
             return
 
-        # ── Location filter ──────────────────────────────────────
+        # ── Location filter — now supports multi-select ──────────
         try:
             raw_df = load_raw_data(str(self.lake_raw))
             locations = sorted(raw_df["location_name"].unique()) if "location_name" in raw_df.columns else []
@@ -351,7 +414,7 @@ class StreamlitFrontend:
             locations, countries = [], []
             raw_df = None
 
-        with st.expander("Location filter", expanded=False):
+        with st.expander("Location filter", expanded=True):
             sel_country = st.selectbox("Country", ["All"] + countries, key="fc_country")
             if sel_country != "All" and raw_df is not None:
                 loc_options = sorted(
@@ -359,45 +422,76 @@ class StreamlitFrontend:
                 )
             else:
                 loc_options = locations
-            sel_location = st.selectbox("Location", ["All"] + loc_options, key="fc_location")
+            sel_locations = st.multiselect(
+                "Locations (select multiple to compare)",
+                loc_options,
+                default=[],
+                key="fc_locations",
+                help="Leave empty to use all data; select multiple to compare trends across locations.",
+            )
 
         # ── Run inference ────────────────────────────────────────
-        with st.spinner("Running forecast..."):
-            try:
-                pipeline = load_pipeline(self.preprocess_dir)
-                model, metadata = load_keras_model(Path(model_dir))
-                seq_len = metadata.get("seq_len", 24)
+        pipeline = None
+        model = None
+        metadata = None
+        try:
+            pipeline = load_pipeline(self.preprocess_dir)
+            model, metadata = load_keras_model(Path(model_dir))
+        except FileNotFoundError as e:
+            st.error(f"Missing artefacts: {e}. Run the training pipeline first.")
+            return
+        except Exception as e:
+            st.error(f"Failed to load model: {e}")
+            return
 
-                _, df_eng = prepare_inference_data(str(self.lake_raw))
-                forecast_df = _run_forecast(
-                    model, pipeline, df_eng,
-                    pipeline.feature_cols, seq_len, n_days,
-                )
+        seq_len = metadata.get("seq_len", 24)
+        df_clean, df_eng = prepare_inference_data(str(self.lake_raw))
 
-                if forecast_df.empty:
-                    st.warning("Not enough data to generate forecasts.")
-                    return
+        # Single location or all data  → simple path
+        # Multiple locations            → per-location forecasts for comparison
+        forecast_locations = sel_locations if sel_locations else ["All"]
+        multi_location = len(forecast_locations) > 1
 
-                forecast_df.index = pd.RangeIndex(1, len(forecast_df) + 1, name="Day")
-                display_df = forecast_df[selected_targets].rename(columns=TARGET_DISPLAY)
+        location_forecasts: Dict[str, pd.DataFrame] = {}
+        with st.spinner("Running forecasts..."):
+            progress = st.progress(0) if multi_location else None
+            for i, loc in enumerate(forecast_locations):
+                try:
+                    df_filtered = _filter_engineered_by_location(
+                        df_clean, df_eng,
+                        country=sel_country if loc == "All" else "All",
+                        location=loc if loc != "All" else "All",
+                    )
+                    fc = _run_forecast(
+                        model, pipeline, df_filtered,
+                        pipeline.feature_cols, seq_len, n_days,
+                    )
+                    if not fc.empty:
+                        fc.index = pd.RangeIndex(1, len(fc) + 1, name="Day")
+                        location_forecasts[loc] = fc
+                except Exception as exc:
+                    logger.warning("Forecast failed for %s: %s", loc, exc)
+                if progress:
+                    progress.progress((i + 1) / len(forecast_locations))
+            if progress:
+                progress.empty()
 
-            except FileNotFoundError as e:
-                st.error(f"Missing artefacts: {e}. Run the training pipeline first.")
-                return
-            except Exception as e:
-                st.error(f"Forecast failed: {e}")
-                logger.exception("Forecast error")
-                return
+        if not location_forecasts:
+            st.warning("Not enough data to generate forecasts.")
+            return
 
-        # ── Metric cards ─────────────────────────────────────────
+        # ── Metric cards (use first / only location) ─────────────
+        first_loc = list(location_forecasts.keys())[0]
+        first_fc = location_forecasts[first_loc]
         metric_cols = st.columns(min(len(selected_targets), 4))
         for i, tgt in enumerate(selected_targets):
             col = metric_cols[i % len(metric_cols)]
-            vals = forecast_df[tgt]
+            vals = first_fc[tgt]
             label = TARGET_DISPLAY.get(tgt, tgt)
             unit = TARGET_UNITS.get(tgt, "")
+            loc_label = f" ({first_loc})" if multi_location else ""
             col.metric(
-                label=label,
+                label=f"{label}{loc_label}",
                 value=f"{vals.mean():.2f} {unit}",
                 delta=f"min {vals.min():.2f} / max {vals.max():.2f}",
             )
@@ -408,29 +502,109 @@ class StreamlitFrontend:
         badge = f"**Model:** {MODEL_NAMES.get(model_name, model_name)}"
         if avg_r2 is not None:
             badge += f" | **Test R\u00b2:** {avg_r2:.4f}"
+        if multi_location:
+            badge += f" | **Locations:** {len(location_forecasts)}"
         st.caption(badge)
 
         # ── Visualisation ────────────────────────────────────────
-        if chart_type in ("Line Chart", "Both"):
-            fig = px.line(
-                display_df,
-                x=display_df.index,
-                y=display_df.columns,
-                markers=True,
-                title="Forecasted Values",
-                labels={"value": "Value", "variable": "Target", "x": "Day"},
-            )
-            fig.update_layout(
-                hovermode="x unified",
-                legend=dict(orientation="h", yanchor="bottom", y=1.02),
-            )
-            st.plotly_chart(fig, use_container_width=True)
+        if not multi_location:
+            # Single location — simple view
+            display_df = first_fc[selected_targets].rename(columns=TARGET_DISPLAY)
 
-        if chart_type in ("Data Table", "Both"):
-            st.dataframe(display_df.style.format("{:.4f}"), use_container_width=True)
+            if chart_type in ("Line Chart", "Both"):
+                fig = px.line(
+                    display_df,
+                    x=display_df.index,
+                    y=display_df.columns,
+                    markers=True,
+                    title="Forecasted Values",
+                    labels={"value": "Value", "variable": "Target", "x": "Day"},
+                )
+                fig.update_layout(
+                    hovermode="x unified",
+                    legend=dict(orientation="h", yanchor="bottom", y=1.02),
+                    template="plotly_white",
+                )
+                st.plotly_chart(fig, use_container_width=True)
+
+            if chart_type in ("Data Table", "Both"):
+                st.dataframe(display_df.style.format("{:.4f}"), use_container_width=True)
+        else:
+            # Multi-location — one chart per target with location-coloured lines
+            tab_chart, tab_table, tab_stats = st.tabs(
+                ["\U0001F4C8 Trend Charts", "\U0001F4CB Data Table", "\U0001F4CA Statistics"]
+            )
+
+            with tab_chart:
+                for tgt in selected_targets:
+                    tgt_label = TARGET_DISPLAY.get(tgt, tgt)
+                    tgt_unit = TARGET_UNITS.get(tgt, "")
+                    fig = go.Figure()
+                    colors = px.colors.qualitative.Set2 + px.colors.qualitative.Pastel
+                    for j, (loc, fc_df) in enumerate(location_forecasts.items()):
+                        fig.add_trace(go.Scatter(
+                            x=list(fc_df.index),
+                            y=fc_df[tgt],
+                            mode="lines+markers",
+                            name=loc,
+                            line=dict(color=colors[j % len(colors)], width=2),
+                            marker=dict(size=6),
+                            hovertemplate=f"<b>{loc}</b><br>Day %{{x}}<br>{tgt_label}: %{{y:.3f}} {tgt_unit}<extra></extra>",
+                        ))
+                    fig.update_layout(
+                        title=f"{tgt_label} — by Location",
+                        xaxis_title="Day",
+                        yaxis_title=f"{tgt_label} ({tgt_unit})",
+                        hovermode="x unified",
+                        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="center", x=0.5),
+                        template="plotly_white",
+                        height=400,
+                    )
+                    st.plotly_chart(fig, use_container_width=True)
+
+            with tab_table:
+                # Build combined table: Day × (Location, Target)
+                rows = []
+                for loc, fc_df in location_forecasts.items():
+                    for day in fc_df.index:
+                        row = {"Day": day, "Location": loc}
+                        for tgt in selected_targets:
+                            row[TARGET_DISPLAY.get(tgt, tgt)] = fc_df.loc[day, tgt]
+                        rows.append(row)
+                combined_df = pd.DataFrame(rows)
+                st.dataframe(
+                    combined_df.style.format(
+                        {c: "{:.4f}" for c in combined_df.columns if c not in ("Day", "Location")}
+                    ),
+                    use_container_width=True,
+                )
+
+            with tab_stats:
+                # Summary statistics per location per target
+                stat_rows = []
+                for loc, fc_df in location_forecasts.items():
+                    row = {"Location": loc}
+                    for tgt in selected_targets:
+                        label = TARGET_DISPLAY.get(tgt, tgt)
+                        vals = fc_df[tgt]
+                        row[f"{label} Mean"] = vals.mean()
+                        row[f"{label} Min"] = vals.min()
+                        row[f"{label} Max"] = vals.max()
+                        row[f"{label} Std"] = vals.std()
+                    stat_rows.append(row)
+                stats_df = pd.DataFrame(stat_rows)
+                st.dataframe(
+                    stats_df.style.format(
+                        {c: "{:.4f}" for c in stats_df.columns if c != "Location"}
+                    ).background_gradient(axis=0, subset=[c for c in stats_df.columns if "Mean" in c]),
+                    use_container_width=True,
+                )
 
         # ── Download ─────────────────────────────────────────────
-        csv = display_df.to_csv()
+        if multi_location:
+            csv = combined_df.to_csv(index=False)
+        else:
+            csv = display_df.to_csv()
         st.download_button(
             "Download CSV",
             data=csv,
@@ -764,73 +938,184 @@ class StreamlitFrontend:
         else:
             loc_filtered = loc_meta
 
-        # ── Run forecast ─────────────────────────────────────────
-        with st.spinner("Running forecast for geographic view..."):
+        # ── Run per-location forecasts ────────────────────────────
+        with st.spinner("Running per-location forecasts..."):
             try:
                 pipeline = load_pipeline(self.preprocess_dir)
                 model, metadata = load_keras_model(Path(model_dir))
                 seq_len = metadata.get("seq_len", 24)
-                _, df_eng = prepare_inference_data(str(self.lake_raw))
-                forecast_df = _run_forecast(
-                    model, pipeline, df_eng,
-                    pipeline.feature_cols, seq_len, n_days,
-                )
-                if forecast_df.empty:
-                    st.warning("Not enough data.")
-                    return
+                df_clean, df_eng = prepare_inference_data(str(self.lake_raw))
             except Exception as e:
                 st.error(f"Forecast failed: {e}")
                 return
 
-        # Build per-country aggregated view using latest raw data
-        # We'll use the raw data's last day per location and overlay
-        # the forecasted mean as a representative value
-        forecast_mean = forecast_df[geo_targets].mean()
+            # Run forecast per location so each gets unique values
+            geo_results = []
+            progress = st.progress(0, text="Forecasting...")
+            total = len(loc_filtered)
+            for idx, (_, row) in enumerate(loc_filtered.iterrows()):
+                loc_name = row["location_name"]
+                try:
+                    df_loc = _filter_engineered_by_location(
+                        df_clean, df_eng,
+                        country="All", location=loc_name,
+                    )
+                    if df_loc.empty:
+                        continue
+                    fc = _run_forecast(
+                        model, pipeline, df_loc,
+                        pipeline.feature_cols, seq_len, n_days,
+                    )
+                    if fc.empty:
+                        continue
+                    loc_means = fc[geo_targets].mean()
+                    result = {
+                        "location_name": loc_name,
+                        "country": row["country"],
+                        "latitude": row["latitude"],
+                        "longitude": row["longitude"],
+                    }
+                    for tgt in geo_targets:
+                        result[TARGET_DISPLAY.get(tgt, tgt)] = loc_means[tgt]
+                    geo_results.append(result)
+                except Exception:
+                    logger.debug("Forecast skipped for %s", loc_name, exc_info=True)
+                progress.progress((idx + 1) / total, text=f"{loc_name}")
+            progress.empty()
 
-        # Attach forecast means to each location
-        map_data = loc_filtered.copy()
-        for tgt in geo_targets:
-            map_data[TARGET_DISPLAY.get(tgt, tgt)] = forecast_mean[tgt]
+            if not geo_results:
+                st.warning("No forecasts could be generated for the selected locations.")
+                return
 
-        tab_map, tab_bar, tab_table = st.tabs(
-            ["Map View", "Country Bar Chart", "Data Table"]
+        map_data = pd.DataFrame(geo_results)
+        agg_cols = [TARGET_DISPLAY.get(t, t) for t in geo_targets]
+
+        tab_map, tab_bar, tab_radar, tab_table = st.tabs(
+            ["\U0001F5FA Map View", "\U0001F4CA Country Bar Chart", "\U0001F3AF Radar", "\U0001F4CB Data Table"]
         )
 
-        # ── Map View ─────────────────────────────────────────────
+        # ── Map View — one sub-map per target ────────────────────
         with tab_map:
-            primary_target = geo_targets[0]
-            primary_label = TARGET_DISPLAY.get(primary_target, primary_target)
+            if len(geo_targets) == 1:
+                # Single target  → one large map
+                tgt = geo_targets[0]
+                label = TARGET_DISPLAY.get(tgt, tgt)
+                fig = px.scatter_mapbox(
+                    map_data, lat="latitude", lon="longitude",
+                    hover_name="location_name",
+                    hover_data={
+                        "country": True, label: ":.3f",
+                        "latitude": ":.2f", "longitude": ":.2f",
+                    },
+                    color=label,
+                    size=np.abs(map_data[label]).clip(lower=0.1).tolist(),
+                    color_continuous_scale="Turbo",
+                    mapbox_style="carto-positron",
+                    zoom=1, height=600,
+                    title=f"Forecast Map — {label}",
+                )
+                st.plotly_chart(fig, use_container_width=True)
+            else:
+                # Multiple targets → one map per target in columns
+                cols_per_row = min(len(geo_targets), 2)
+                for row_start in range(0, len(geo_targets), cols_per_row):
+                    row_targets = geo_targets[row_start:row_start + cols_per_row]
+                    cols = st.columns(len(row_targets))
+                    for ci, tgt in enumerate(row_targets):
+                        label = TARGET_DISPLAY.get(tgt, tgt)
+                        with cols[ci]:
+                            fig = px.scatter_mapbox(
+                                map_data, lat="latitude", lon="longitude",
+                                hover_name="location_name",
+                                hover_data={
+                                    "country": True, label: ":.3f",
+                                    "latitude": ":.2f", "longitude": ":.2f",
+                                },
+                                color=label,
+                                size=np.abs(map_data[label]).clip(lower=0.1).tolist(),
+                                color_continuous_scale="Turbo",
+                                mapbox_style="carto-positron",
+                                zoom=1, height=400,
+                                title=label,
+                            )
+                            fig.update_layout(margin=dict(l=0, r=0, t=30, b=0))
+                            st.plotly_chart(fig, use_container_width=True)
 
-            fig = px.scatter_mapbox(
-                map_data,
-                lat="latitude",
-                lon="longitude",
-                hover_name="location_name",
-                hover_data={"country": True, "latitude": ":.2f", "longitude": ":.2f"},
-                color=primary_label,
-                size=np.abs(map_data[primary_label]).clip(lower=1).tolist(),
-                color_continuous_scale="Turbo",
-                mapbox_style="carto-positron",
-                zoom=1, height=600,
-                title=f"Forecast Map — {primary_label}",
-            )
-            st.plotly_chart(fig, use_container_width=True)
-
-        # ── Country Bar Chart ────────────────────────────────────
+        # ── Country Bar Chart — grouped by target ────────────────
         with tab_bar:
-            # Aggregate by country
-            agg_cols = [TARGET_DISPLAY.get(t, t) for t in geo_targets]
             country_agg = map_data.groupby("country")[agg_cols].mean().reset_index()
-
+            melted = country_agg.melt(
+                id_vars="country", var_name="Target", value_name="Value",
+            )
             fig = px.bar(
-                country_agg.melt(id_vars="country", var_name="Target", value_name="Value"),
-                x="country", y="Value", color="Target",
+                melted, x="country", y="Value", color="Target",
                 barmode="group",
                 title="Mean Forecast by Country",
                 labels={"country": "Country"},
+                color_discrete_sequence=px.colors.qualitative.Set2,
             )
-            fig.update_layout(xaxis_tickangle=-45)
+            fig.update_layout(
+                xaxis_tickangle=-45,
+                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="center", x=0.5),
+                template="plotly_white",
+            )
             st.plotly_chart(fig, use_container_width=True)
+
+            # Per-target box plots showing spread across locations
+            if len(geo_targets) > 1:
+                st.subheader("Distribution across locations")
+                melted_loc = map_data.melt(
+                    id_vars=["location_name", "country"],
+                    value_vars=agg_cols,
+                    var_name="Target", value_name="Value",
+                )
+                fig_box = px.box(
+                    melted_loc, x="Target", y="Value", color="Target",
+                    points="all",
+                    title="Forecast distribution by target across all locations",
+                    color_discrete_sequence=px.colors.qualitative.Set2,
+                )
+                fig_box.update_layout(showlegend=False, template="plotly_white")
+                st.plotly_chart(fig_box, use_container_width=True)
+
+        # ── Radar chart — multi-target per country ───────────────
+        with tab_radar:
+            if len(geo_targets) < 2:
+                st.info("Select at least 2 targets to see the radar chart.")
+            else:
+                country_agg = map_data.groupby("country")[agg_cols].mean().reset_index()
+                # Normalise to [0, 1] for comparability on radar
+                normalised = country_agg[agg_cols].copy()
+                for col in agg_cols:
+                    col_min, col_max = normalised[col].min(), normalised[col].max()
+                    if col_max > col_min:
+                        normalised[col] = (normalised[col] - col_min) / (col_max - col_min)
+                    else:
+                        normalised[col] = 0.5
+
+                fig = go.Figure()
+                colors = px.colors.qualitative.Vivid
+                for i, (_, row) in enumerate(country_agg.iterrows()):
+                    country_name = row["country"]
+                    vals = normalised.iloc[i].tolist()
+                    fig.add_trace(go.Scatterpolar(
+                        r=vals + [vals[0]],  # close the polygon
+                        theta=agg_cols + [agg_cols[0]],
+                        fill="toself",
+                        name=country_name,
+                        line=dict(color=colors[i % len(colors)]),
+                        opacity=0.6,
+                    ))
+                fig.update_layout(
+                    title="Normalised Target Profiles by Country",
+                    polar=dict(radialaxis=dict(visible=True, range=[0, 1])),
+                    template="plotly_white",
+                    height=500,
+                    legend=dict(orientation="h", yanchor="bottom", y=-0.2, xanchor="center", x=0.5),
+                )
+                st.plotly_chart(fig, use_container_width=True)
+                st.caption("Values are min-max normalised per target for visual comparison. "
+                           "Hover for country details.")
 
         # ── Data Table ───────────────────────────────────────────
         with tab_table:

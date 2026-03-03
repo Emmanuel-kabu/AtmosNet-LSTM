@@ -78,16 +78,16 @@ logger = logging.getLogger(__name__)
 # and all dependencies.  Build & push it with:
 #
 #   docker build -f docker/Dockerfile.flyte \
-#       -t ghcr.io/emmanuelkabu/atm-forecast-flyte:latest .
-#   docker push ghcr.io/emmanuelkabu/atm-forecast-flyte:latest
+#       -t ghcr.io/emmanuelkabu/atmosml-flyte:latest .
+#   docker push ghcr.io/emmanuelkabu/atmosml-flyte:latest
 #
 # The image tag is the SINGLE source of truth for the execution env.
 # =====================================================================
 
-FLYTE_IMAGE = "ghcr.io/emmanuelkabu/atm-forecast-flyte:latest"
+FLYTE_IMAGE = "ghcr.io/emmanuelkabu/atmosml-flyte:latest"
 
 env = flyte.TaskEnvironment(
-    name="atm-forecast",
+    name="atmosml",
     image=FLYTE_IMAGE,
 )
 
@@ -122,7 +122,7 @@ class PipelineConfig:
     # Tracking
     use_wandb: bool = False
     mlflow_experiment: str = "atm-forecast"
-    mlflow_tracking_uri: str = "mlruns"
+    mlflow_tracking_uri: str = "http://localhost:5000"
 
 
 # =====================================================================
@@ -130,8 +130,7 @@ class PipelineConfig:
 # =====================================================================
 
 @env.task(
-    cache=True,
-    cache_version="1.0",
+    cache="auto",
     retries=2,
 )
 def load_raw_data(config: PipelineConfig) -> str:
@@ -144,10 +143,10 @@ def load_raw_data(config: PipelineConfig) -> str:
     """
     import pandas as pd
     from atm_forecast.config import get_settings
+    import tempfile
 
     settings = get_settings()
-    ctx = flyte.current_context()
-    work_dir = Path(ctx.working_directory) / "pipeline_data"
+    work_dir = Path(tempfile.mkdtemp(prefix="atm_pipeline_")) / "pipeline_data"
     work_dir.mkdir(parents=True, exist_ok=True)
 
     if config.use_lake:
@@ -175,8 +174,7 @@ def load_raw_data(config: PipelineConfig) -> str:
 # =====================================================================
 
 @env.task(
-    cache=True,
-    cache_version="1.0",
+    cache="auto",
     retries=1,
 )
 def preprocess_data(raw_path: str) -> str:
@@ -207,8 +205,7 @@ def preprocess_data(raw_path: str) -> str:
 # =====================================================================
 
 @env.task(
-    cache=True,
-    cache_version="1.0",
+    cache="auto",
     retries=1,
 )
 def engineer_features(clean_path: str) -> str:
@@ -239,8 +236,7 @@ def engineer_features(clean_path: str) -> str:
 # =====================================================================
 
 @env.task(
-    cache=True,
-    cache_version="1.0",
+    cache="auto",
     retries=1,
 )
 def prepare_training_data(
@@ -333,7 +329,7 @@ def prepare_training_data(
 # =====================================================================
 
 @env.task(
-    cache=False,
+    cache="disable",
     retries=0,
     timeout=timedelta(hours=4),
 )
@@ -352,7 +348,7 @@ def train_single_model(
     Returns a metrics dict for this model.
     """
     import numpy as np
-    from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau
+    from keras.callbacks import EarlyStopping, ReduceLROnPlateau
     from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
     from atm_forecast.config import get_settings
     from atm_forecast.data.preprocessing import PreprocessingPipeline, TARGETS
@@ -409,6 +405,8 @@ def train_single_model(
             )
             init_wandb(
                 project=settings.wandb_project,
+                entity=settings.wandb_entity,
+                api_key=settings.wandb_api_key,
                 config={
                     "model": model_name, "epochs": config.epochs,
                     "batch_size": config.batch_size,
@@ -559,7 +557,7 @@ def train_single_model(
 # =====================================================================
 
 @env.task(
-    cache=False,
+    cache="disable",
     retries=1,
 )
 def evaluate_models(
@@ -625,7 +623,7 @@ def evaluate_models(
 # =====================================================================
 
 @env.task(
-    cache=False,
+    cache="disable",
     retries=1,
 )
 def deploy_best_model(
@@ -686,12 +684,20 @@ def deploy_best_model(
         client = mlflow.tracking.MlflowClient()
 
         try:
-            versions = client.search_model_versions(f"name='{best_name}'")
+            versions = client.search_model_versions(
+                filter_string=f"name='{best_name}'",
+            )
             if versions:
                 latest = max(versions, key=lambda v: int(v.version))
-                client.set_model_version_tag(
-                    best_name, latest.version, "stage", "champion",
-                )
+                # Use aliases instead of deprecated stage tags
+                try:
+                    client.set_registered_model_alias(
+                        name=best_name,
+                        alias="champion",
+                        version=latest.version,
+                    )
+                except Exception:
+                    pass  # alias API may not be available on older servers
                 client.set_model_version_tag(
                     best_name, latest.version, "promoted_at", now.isoformat(),
                 )
@@ -764,46 +770,75 @@ def deploy_best_model(
 # =====================================================================
 
 @env.task(
-    cache=False,
+    cache="disable",
     retries=1,
 )
 def check_data_readiness(config: PipelineConfig) -> dict:
     """Verify that the raw layer has enough NEW data for a CT run.
 
     Checks:
-    - At least ``config.min_new_rows`` rows exist in the raw layer.
+    - At least ``config.min_new_rows`` NEW rows since last training.
     - NaN ratio is below 10%.
     - Watermark indicates new data since last training.
     """
     from atm_forecast.config import get_settings
-    from atm_forecast.data.lake import LAYER_RAW, list_partition_dates, read_all_partitions
+    from atm_forecast.data.lake import LAYER_FEATURES, list_partition_dates, read_all_partitions
     from atm_forecast.data.pipeline_state import get_engine, get_watermark
     import numpy as np
 
     settings = get_settings()
-    raw_dates = list_partition_dates(settings.lake_root, LAYER_RAW)
-    if not raw_dates:
-        return {"ready": False, "reason": "no_raw_partitions", "n_rows": 0}
 
-    df = read_all_partitions(settings.lake_root, LAYER_RAW)
-    n_rows = len(df)
-    null_pct = float(df.isnull().mean().mean()) * 100
+    # Read from features layer (not raw) — drift should be checked on
+    # engineered features, not raw data
+    try:
+        feat_dates = list_partition_dates(settings.lake_root, LAYER_FEATURES)
+    except (FileNotFoundError, OSError):
+        feat_dates = []
+    if not feat_dates:
+        return {"ready": False, "reason": "no_feature_partitions", "n_rows": 0}
 
     engine = get_engine(settings.database_url)
     wm = get_watermark(engine, "ml_training")
     is_first_run = wm.last_success_at is None
-    ready = (n_rows >= config.min_new_rows) or is_first_run
+
+    # Filter to partitions newer than the last training watermark
+    if not is_first_run and wm.last_partition_date is not None:
+        new_dates = [d for d in feat_dates if d > wm.last_partition_date]
+    else:
+        new_dates = feat_dates
+
+    df = read_all_partitions(settings.lake_root, LAYER_FEATURES)
+    n_total_rows = len(df)
+
+    # Count rows from new partitions only
+    if new_dates and not is_first_run:
+        from atm_forecast.data.lake import read_partitions_by_dates
+        try:
+            df_new = read_partitions_by_dates(
+                settings.lake_root, LAYER_FEATURES, new_dates
+            )
+            n_new_rows = len(df_new)
+        except Exception:
+            # Fallback: use total rows if partition-aware read fails
+            n_new_rows = n_total_rows
+    else:
+        n_new_rows = n_total_rows
+
+    null_pct = float(df.isnull().mean().mean()) * 100
+    ready = (n_new_rows >= config.min_new_rows) or is_first_run
 
     if null_pct > 10.0:
         ready = False
 
     summary = {
         "ready": ready,
-        "n_partitions": len(raw_dates),
-        "n_rows": n_rows,
+        "n_partitions": len(feat_dates),
+        "n_new_partitions": len(new_dates),
+        "n_total_rows": n_total_rows,
+        "n_new_rows": n_new_rows,
         "null_pct": round(null_pct, 2),
         "is_first_run": is_first_run,
-        "date_range": [str(min(raw_dates)), str(max(raw_dates))],
+        "date_range": [str(min(feat_dates)), str(max(feat_dates))],
         "last_trained_at": (
             wm.last_success_at.isoformat() if wm.last_success_at else None
         ),
@@ -813,25 +848,37 @@ def check_data_readiness(config: PipelineConfig) -> dict:
 
 
 @env.task(
-    cache=False,
+    cache="disable",
     retries=1,
 )
 def detect_drift(config: PipelineConfig, readiness: dict) -> dict:
-    """Run Evidently / KS-test drift detection on the raw layer.
+    """Run Evidently drift detection on the features layer.
 
-    Splits data 80/20 chronologically; if drift score exceeds the
-    threshold **or** this is the first run, the pipeline proceeds.
+    Uses the CTMonitor's reference store to compare current features
+    against the training data snapshot. Falls back to KS-test if
+    Evidently is unavailable.
+
+    If this is the first run or no reference exists, the pipeline
+    always proceeds to training.
     """
     if not readiness.get("ready", False):
         return {"should_retrain": False, "reason": "data_not_ready"}
 
     from atm_forecast.config import get_settings
-    from atm_forecast.data.lake import LAYER_RAW, read_all_partitions
-    import numpy as np
+    from atm_forecast.data.lake import LAYER_FEATURES, read_all_partitions
+    from atm_forecast.monitoring.ct_monitor import CTMonitor
 
     settings = get_settings()
-    df = read_all_partitions(settings.lake_root, LAYER_RAW)
-    numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+
+    # Read from features layer (not raw) — drift on engineered data
+    try:
+        df = read_all_partitions(settings.lake_root, LAYER_FEATURES)
+    except (FileNotFoundError, OSError):
+        return {
+            "should_retrain": readiness.get("is_first_run", True),
+            "drift_detected": False,
+            "reason": "no_feature_partitions",
+        }
 
     if len(df) < 200:
         return {
@@ -840,50 +887,39 @@ def detect_drift(config: PipelineConfig, readiness: dict) -> dict:
             "reason": "insufficient_data_for_drift",
         }
 
-    split_idx = int(len(df) * 0.8)
-    reference = df[numeric_cols].iloc[:split_idx]
-    current = df[numeric_cols].iloc[split_idx:]
+    # Use CTMonitor for unified drift detection with reference store
+    ct = CTMonitor(
+        reports_dir=str(settings.evidently_reports_dir),
+        mlflow_tracking_uri=config.mlflow_tracking_uri,
+        drift_threshold=config.drift_threshold,
+    )
 
-    drift_score = 0.0
-    drifted_features: List[str] = []
-    try:
-        from atm_forecast.monitoring.evidently_monitor import generate_data_drift_report
+    is_first_run = readiness.get("is_first_run", False)
+    drift_result = ct.check_and_decide(
+        current_data=df,
+        is_first_run=is_first_run,
+    )
 
-        result = generate_data_drift_report(
-            reference_data=reference,
-            current_data=current,
-            save_dir=str(settings.evidently_reports_dir),
-        )
-        drift_score = result.get("dataset_drift_share", 0.0)
-        drifted_features = result.get("drifted_columns", [])
-    except ImportError:
-        from scipy.stats import ks_2samp
+    should_retrain = drift_result.get("should_retrain", False)
 
-        n_drifted = 0
-        for col in numeric_cols:
-            _, p_val = ks_2samp(reference[col].dropna(), current[col].dropna())
-            if p_val < config.drift_threshold:
-                n_drifted += 1
-                drifted_features.append(col)
-        drift_score = n_drifted / max(len(numeric_cols), 1)
-    except Exception as exc:
-        logger.warning("Drift detection failed: %s — defaulting to retrain", exc)
-        return {"should_retrain": True, "drift_detected": True, "reason": "error", "error": str(exc)}
-
-    drift_detected = drift_score > config.drift_threshold
-    should_retrain = drift_detected or readiness.get("is_first_run", False)
+    # Extract summary from the unified result
+    data_drift = drift_result.get("data_drift", {})
+    concept_drift = drift_result.get("concept_drift", {})
 
     summary = {
         "should_retrain": should_retrain,
-        "drift_detected": drift_detected,
-        "drift_score": round(drift_score, 4),
-        "n_drifted_features": len(drifted_features),
-        "drifted_features": drifted_features[:10],
-        "reason": (
-            "drift_above_threshold" if drift_detected
-            else "first_run" if readiness.get("is_first_run")
+        "drift_detected": data_drift.get("drift_detected", False),
+        "concept_drift_detected": concept_drift.get("concept_drift_detected", False),
+        "drift_score": data_drift.get("drift_score", 0.0),
+        "n_drifted_features": data_drift.get("n_drifted_features", 0),
+        "drifted_features": data_drift.get("drifted_features", [])[:10],
+        "n_targets_drifted": concept_drift.get("n_targets_drifted", 0),
+        "reason": drift_result.get("reason", (
+            "drift_above_threshold" if data_drift.get("drift_detected")
+            else "concept_drift" if concept_drift.get("concept_drift_detected")
+            else "first_run" if is_first_run
             else "no_significant_drift"
-        ),
+        )),
     }
     logger.info("Drift result: %s", json.dumps(summary, indent=2))
     return summary
@@ -893,7 +929,11 @@ def detect_drift(config: PipelineConfig, readiness: dict) -> dict:
 # Workflow 1 — Full ML Pipeline
 # =====================================================================
 
-@flyte.workflow
+@env.task(
+    cache="auto",
+    retries=0,
+    timeout=timedelta(hours=12),
+)
 def ml_pipeline(
     models: List[str] = ["bilstm", "tcn", "tft"],
     epochs: int = 50,
@@ -908,14 +948,14 @@ def ml_pipeline(
     mlflow_experiment: str = "atm-forecast",
     mlflow_tracking_uri: str = "mlruns",
 ) -> dict:
-    """AtmosNet Full ML Pipeline (Flyte).
+    """AtmosNet Full ML Pipeline (Flyte v2).
 
     End-to-end workflow:
     1. **load_raw_data** — read raw Parquet from the data lake.
     2. **preprocess_data** — clean, fill NaN, clip outliers.
     3. **engineer_features** — create lag, rolling, cyclical, interaction features.
     4. **prepare_training_data** — split, scale, create sliding-window sequences.
-    5. **train_single_model** × N — train each architecture in parallel.
+    5. **train_single_model** × N — train each architecture.
     6. **evaluate_models** — compare all models, select champion.
     7. **deploy_best_model** — promote to MLflow registry + serving dir.
 
@@ -945,21 +985,16 @@ def ml_pipeline(
     feat_path = engineer_features(clean_path=clean_path)
     data_summary = prepare_training_data(features_path=feat_path, config=config)
 
-    # ── Training (one task per model — Flyte parallelises) ───────
-    bilstm_result = train_single_model(
-        model_name="bilstm", data_summary=data_summary, config=config,
-    )
-    tcn_result = train_single_model(
-        model_name="tcn", data_summary=data_summary, config=config,
-    )
-    tft_result = train_single_model(
-        model_name="tft", data_summary=data_summary, config=config,
-    )
+    # ── Training (one task per model) ────────────────────────────
+    model_results = []
+    for model_name in models:
+        result = train_single_model(
+            model_name=model_name, data_summary=data_summary, config=config,
+        )
+        model_results.append(result)
 
     # ── Evaluation & deployment ──────────────────────────────────
-    evaluation = evaluate_models(
-        model_results=[bilstm_result, tcn_result, tft_result], config=config,
-    )
+    evaluation = evaluate_models(model_results=model_results, config=config)
     deployment = deploy_best_model(evaluation=evaluation, config=config)
 
     return deployment
@@ -969,7 +1004,11 @@ def ml_pipeline(
 # Workflow 2 — Continuous Training (drift-gated)
 # =====================================================================
 
-@flyte.workflow
+@env.task(
+    cache="disable",
+    retries=0,
+    timeout=timedelta(hours=12),
+)
 def ct_pipeline(
     models: List[str] = ["bilstm", "tcn", "tft"],
     epochs: int = 30,
@@ -982,16 +1021,22 @@ def ct_pipeline(
     promote_r2_threshold: float = 0.7,
     use_wandb: bool = False,
     mlflow_experiment: str = "atm-forecast-ct",
-    mlflow_tracking_uri: str = "mlruns",
+    mlflow_tracking_uri: str = "http://localhost:5000",
 ) -> dict:
-    """AtmosNet Continuous Training Pipeline (Flyte).
+    """AtmosNet Continuous Training Pipeline (Flyte v2).
 
     Same core tasks as ``ml_pipeline`` but gated by:
     1. **check_data_readiness** — enough new data since last run?
-    2. **detect_drift** — has the distribution shifted?
+    2. **detect_drift** — data + concept drift via Evidently/KS-test?
 
     Only proceeds to preprocessing → training → evaluation → deployment
     if drift is detected or it is the first run.
+
+    Post-training hooks:
+    - Updates ``ml_training`` watermark so next CT run sees only new data.
+    - Saves current features as reference snapshot for future drift comparison.
+    - Logs feature dataset to MLflow for lineage tracking.
+    - Pushes training metrics to Prometheus gauges.
 
     Usage::
 
@@ -1017,56 +1062,174 @@ def ct_pipeline(
     readiness = check_data_readiness(config=config)
     drift = detect_drift(config=config, readiness=readiness)
 
+    if not drift.get("should_retrain", False):
+        logger.info("No retrain needed: %s", drift.get("reason", "unknown"))
+        return {"deployed": False, "reason": drift.get("reason", "no_retrain")}
+
     # ── Core ML pipeline (re-uses the same tasks) ────────────────
     raw_path = load_raw_data(config=config)
     clean_path = preprocess_data(raw_path=raw_path)
     feat_path = engineer_features(clean_path=clean_path)
     data_summary = prepare_training_data(features_path=feat_path, config=config)
 
-    bilstm_result = train_single_model(
-        model_name="bilstm", data_summary=data_summary, config=config,
-    )
-    tcn_result = train_single_model(
-        model_name="tcn", data_summary=data_summary, config=config,
-    )
-    tft_result = train_single_model(
-        model_name="tft", data_summary=data_summary, config=config,
-    )
+    # ── Log feature dataset to MLflow ────────────────────────────
+    try:
+        import pandas as pd
+        from atm_forecast.monitoring.ct_monitor import MLflowDatasetLogger
 
-    evaluation = evaluate_models(
-        model_results=[bilstm_result, tcn_result, tft_result], config=config,
-    )
+        df_features = pd.read_parquet(feat_path)
+        ds_logger = MLflowDatasetLogger(tracking_uri=config.mlflow_tracking_uri)
+        ds_logger.log_feature_dataset(
+            df_features,
+            name="atm_features_ct",
+            tags={
+                "drift_score": drift.get("drift_score", 0.0),
+                "drift_detected": drift.get("drift_detected", False),
+                "concept_drift_detected": drift.get("concept_drift_detected", False),
+                "n_rows": len(df_features),
+            },
+            save_path=Path("artifacts") / "datasets" / "ct_features.parquet",
+        )
+        logger.info("Feature dataset logged to MLflow (%d rows)", len(df_features))
+    except Exception as exc:
+        logger.warning("MLflow dataset logging failed (non-fatal): %s", exc)
+
+    model_results = []
+    for model_name in models:
+        result = train_single_model(
+            model_name=model_name, data_summary=data_summary, config=config,
+        )
+        model_results.append(result)
+
+    evaluation = evaluate_models(model_results=model_results, config=config)
     deployment = deploy_best_model(evaluation=evaluation, config=config)
 
+    # ── Post-training: update watermark ──────────────────────────
+    try:
+        from atm_forecast.config import get_settings
+        from atm_forecast.data.pipeline_state import get_engine, update_watermark
+        from atm_forecast.data.lake import LAYER_FEATURES, list_partition_dates
+        import pandas as pd
+
+        settings = get_settings()
+        feat_dates = list_partition_dates(settings.lake_root, LAYER_FEATURES)
+        df_feat = pd.read_parquet(feat_path)
+
+        update_watermark(
+            get_engine(settings.database_url),
+            "ml_training",
+            last_success_at=datetime.now(timezone.utc),
+            last_partition_date=max(feat_dates) if feat_dates else date.today(),
+            rows_ingested=len(df_feat),
+        )
+        logger.info("ml_training watermark updated (rows=%d)", len(df_feat))
+    except Exception as exc:
+        logger.warning("Watermark update failed (non-fatal): %s", exc)
+
+    # ── Post-training: save reference + Prometheus ───────────────
+    try:
+        from atm_forecast.monitoring.ct_monitor import CTMonitor
+        import pandas as pd
+
+        ct = CTMonitor(
+            mlflow_tracking_uri=config.mlflow_tracking_uri,
+            drift_threshold=config.drift_threshold,
+        )
+        df_feat = pd.read_parquet(feat_path)
+        champion = deployment.get("champion_model", deployment.get("model_name", "unknown"))
+        ct.post_training_hook(
+            training_data=df_feat,
+            model_name=champion,
+            metrics=evaluation.get("best_metrics", evaluation.get("metrics", {})),
+        )
+    except Exception as exc:
+        logger.warning("Post-training hook failed (non-fatal): %s", exc)
+
+    deployment["drift_info"] = drift
     return deployment
 
 
 # =====================================================================
-# Launch Plans (scheduled execution)
+# Entry point — run pipelines locally or on a Flyte cluster
 # =====================================================================
 
-# Weekly full retrain — every Monday at 06:00 UTC
-weekly_full_train = flyte.LaunchPlan.create(
-    name="ml_weekly_full_train",
-    workflow=ml_pipeline,
-    schedule=flyte.CronSchedule(schedule="0 6 * * 1"),
-    default_inputs={
-        "models": ["bilstm", "tcn", "tft"],
-        "epochs": 50,
-        "promote_r2_threshold": 0.7,
-    },
-)
+if __name__ == "__main__":
+    import argparse
+    from atm_forecast.config import get_settings as _get_cli_settings
+    _cli_settings = _get_cli_settings()
 
-# Daily CT — drift-gated retrain with fewer epochs
-daily_ct = flyte.LaunchPlan.create(
-    name="ct_daily_drift_check",
-    workflow=ct_pipeline,
-    schedule=flyte.CronSchedule(schedule="0 4 * * *"),
-    default_inputs={
-        "models": ["bilstm", "tcn", "tft"],
-        "epochs": 20,
-        "drift_threshold": 0.03,
-        "min_new_rows": 50,
-        "promote_r2_threshold": 0.65,
-    },
-)
+    parser = argparse.ArgumentParser(description="AtmosNet ML Pipeline")
+    parser.add_argument(
+        "pipeline", nargs="?", default="ml_pipeline",
+        choices=["ml_pipeline", "ct_pipeline"],
+        help="Which pipeline to run (default: ml_pipeline)",
+    )
+    parser.add_argument("--remote", action="store_true",
+                        help="Submit to Flyte cluster instead of running locally")
+    parser.add_argument("--models", type=str, default='["bilstm","tcn","tft"]',
+                        help='JSON list of model names (default: \'["bilstm","tcn","tft"]\')')
+    parser.add_argument("--epochs", type=int, default=50)
+    parser.add_argument("--batch-size", type=int, default=32)
+    parser.add_argument("--sequence-length", type=int, default=24)
+    parser.add_argument("--forecast-horizon", type=int, default=1)
+    parser.add_argument("--learning-rate", type=float, default=1e-3)
+    parser.add_argument("--use-lake", action="store_true", default=True)
+    parser.add_argument("--data-path", type=str, default="")
+    parser.add_argument("--promote-r2-threshold", type=float, default=0.7)
+    parser.add_argument("--use-wandb", action="store_true",
+                        default=_cli_settings.wandb_enabled,
+                        help="Enable W&B tracking (default: from ATM_WANDB_ENABLED)")
+    parser.add_argument("--mlflow-experiment", type=str, default="atm-forecast")
+    parser.add_argument("--mlflow-tracking-uri", type=str, default="http://localhost:5000")
+    parser.add_argument("--drift-threshold", type=float, default=0.05)
+    parser.add_argument("--min-new-rows", type=int, default=100)
+
+    args = parser.parse_args()
+    models_list = json.loads(args.models)
+
+    # ── Initialise Flyte v2 SDK ──────────────────────────────────
+    # With flyte[tui] installed the TUI renders automatically.
+    # --remote  → connect to a Flyte cluster (endpoint from config)
+    # otherwise → local execution with the interactive TUI
+    if args.remote:
+        flyte.init_from_config()
+    else:
+        flyte.init(
+            project="atm-forecast",
+            domain="development",
+        )
+
+    # ── Build kwargs for the chosen pipeline ─────────────────────
+    common_kw = dict(
+        models=models_list,
+        epochs=args.epochs,
+        batch_size=args.batch_size,
+        sequence_length=args.sequence_length,
+        forecast_horizon=args.forecast_horizon,
+        learning_rate=args.learning_rate,
+        promote_r2_threshold=args.promote_r2_threshold,
+        use_wandb=args.use_wandb,
+        mlflow_experiment=args.mlflow_experiment,
+        mlflow_tracking_uri=args.mlflow_tracking_uri,
+    )
+
+    if args.pipeline == "ct_pipeline":
+        common_kw.update(
+            drift_threshold=args.drift_threshold,
+            min_new_rows=args.min_new_rows,
+        )
+        run_handle = flyte.run(ct_pipeline, **common_kw)
+    else:
+        common_kw.update(
+            use_lake=args.use_lake,
+            data_path=args.data_path,
+        )
+        run_handle = flyte.run(ml_pipeline, **common_kw)
+
+    # flyte.run() returns the result directly in local mode,
+    # or a Run handle with .result() in remote mode.
+    if hasattr(run_handle, "result"):
+        result = run_handle.result()
+    else:
+        result = run_handle
+    print(json.dumps(result, indent=2, default=str))

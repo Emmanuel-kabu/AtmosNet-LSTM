@@ -34,7 +34,7 @@ from typing import Dict, List, Literal
 import numpy as np
 import pandas as pd
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
-from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau
+from keras.callbacks import EarlyStopping, ReduceLROnPlateau
 
 from atm_forecast.config import get_settings
 from atm_forecast.data.preprocessing import (
@@ -96,7 +96,7 @@ def run_training(
     models_to_train: List[Literal["bilstm", "tcn", "tft"]] | None = None,
     use_lake: bool = True,
     mlflow_experiment: str = "atm-forecast",
-    mlflow_tracking_uri: str = "mlruns",
+    mlflow_tracking_uri: str = "http://localhost:5000",
     **overrides,
 ) -> Path:
     """Execute the full training pipeline for all models.
@@ -152,6 +152,8 @@ def run_training(
     if settings.wandb_enabled:
         wandb_run = init_wandb(
             project=settings.wandb_project,
+            entity=settings.wandb_entity,
+            api_key=settings.wandb_api_key,
             config={
                 "epochs": epochs,
                 "batch_size": batch_size,

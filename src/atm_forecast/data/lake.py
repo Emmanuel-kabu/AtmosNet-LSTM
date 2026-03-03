@@ -173,6 +173,42 @@ def list_partition_dates(lake_root: Path, layer: str) -> list[date]:
     return dates
 
 
+def read_partitions_by_dates(
+    lake_root: Path,
+    layer: str,
+    dates: list[date],
+) -> pd.DataFrame:
+    """Read only the specified date partitions from a layer.
+
+    Parameters
+    ----------
+    lake_root : Path
+        Root of the data lake (e.g. ``data/lake``).
+    layer : str
+        Layer name (e.g. ``"features"``, ``"raw"``).
+    dates : list[date]
+        Specific partition dates to read.
+
+    Returns
+    -------
+    pd.DataFrame
+        Concatenated data from the requested partitions.
+    """
+    layer_dir = lake_root / layer
+    frames = []
+    for d in sorted(dates):
+        part_dir = layer_dir / f"date={d.isoformat()}"
+        if part_dir.exists():
+            parquet_files = sorted(part_dir.glob("*.parquet"))
+            for f in parquet_files:
+                frames.append(pd.read_parquet(f))
+    if not frames:
+        raise FileNotFoundError(
+            f"No data found for dates {[str(d) for d in dates]} in {layer_dir}"
+        )
+    return pd.concat(frames, ignore_index=True)
+
+
 def pending_partitions(
     lake_root: Path,
     source_layer: str,

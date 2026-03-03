@@ -19,8 +19,8 @@ import logging
 from typing import Literal
 
 import tensorflow as tf
-from tensorflow import keras
-from tensorflow.keras import layers
+import keras
+from keras import layers
 
 logger = logging.getLogger(__name__)
 

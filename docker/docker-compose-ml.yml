@@ -1,12 +1,11 @@
-version: "3.9"
-
+name: atm-forecast-ml
 services:
   # ── API Service ──────────────────────────────────────────────────────
   api:
     build:
       context: ..
       dockerfile: docker/Dockerfile
-    container_name: atm-forecast-api
+    container_name: atmosml-api
     ports:
       - "8000:8000"
     env_file:
@@ -29,7 +28,7 @@ services:
     build:
       context: ..
       dockerfile: docker/Dockerfile.dev
-    container_name: atm-forecast-api-dev
+    container_name: atmosml-api-dev
     ports:
       - "8000:8000"
     env_file:
@@ -46,27 +45,38 @@ services:
 
   # ── MLflow Tracking Server ──────────────────────────────────────────
   mlflow:
-    image: ghcr.io/mlflow/mlflow:v2.12.2
-    container_name: atm-forecast-mlflow
+    image: ghcr.io/mlflow/mlflow:v3.1.0
+    container_name: atmosml-mlflow
     ports:
       - "5000:5000"
-    command: >
-      mlflow server
-        --host 0.0.0.0
-        --port 5000
-        --backend-store-uri sqlite:///mlflow.db
-        --default-artifact-root /mlflow/artifacts
+    entrypoint: /bin/sh
+    command:
+      - -c
+      - |
+        pip install --quiet psycopg2-binary
+        mlflow server \
+          --host 0.0.0.0 \
+          --port 5000 \
+          --backend-store-uri postgresql://atm:atm_secret@postgres:5432/atm_forecast \
+          --default-artifact-root /mlflow/artifacts
     volumes:
       - mlflow_data:/mlflow
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5000/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
     networks:
       - atm-network
-    profiles:
-      - tracking
 
   # ── Prometheus ──────────────────────────────────────────────────────
   prometheus:
     image: prom/prometheus:v2.51.2
-    container_name: atm-forecast-prometheus
+    container_name: atmosml-prometheus
     ports:
       - "9090:9090"
     volumes:
@@ -84,7 +94,7 @@ services:
   # ── Grafana ─────────────────────────────────────────────────────────
   grafana:
     image: grafana/grafana:10.4.2
-    container_name: atm-forecast-grafana
+    container_name: atmosml-grafana
     ports:
       - "3000:3000"
     environment:
@@ -105,7 +115,7 @@ services:
   # ── Postgres (pipeline watermarks / metadata) ───────────────────────
   postgres:
     image: postgres:16-alpine
-    container_name: atm-forecast-postgres
+    container_name: atmosml-postgres
     ports:
       - "5432:5432"
     environment:
@@ -122,11 +132,98 @@ services:
     networks:
       - atm-network
 
+  # ── Airflow (data pipeline orchestration) ───────────────────────────
+  airflow-init:
+    image: apache/airflow:2.10.4-python3.12
+    container_name: atmosml-airflow-init
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        airflow db migrate
+        airflow users create \
+          --username admin --password admin \
+          --firstname Admin --lastname User \
+          --role Admin --email admin@localhost || true
+    environment:
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://atm:atm_secret@postgres:5432/atm_forecast
+      AIRFLOW__CORE__FERNET_KEY: ""
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - atm-network
+    profiles:
+      - airflow
+
+  airflow-webserver:
+    image: apache/airflow:2.10.4-python3.12
+    container_name: atmosml-airflow-webserver
+    command: airflow webserver --port 8080
+    ports:
+      - "8080:8080"
+    environment:
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://atm:atm_secret@postgres:5432/atm_forecast
+      AIRFLOW__CORE__FERNET_KEY: ""
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+      AIRFLOW__WEBSERVER__SECRET_KEY: atm-forecast-secret
+    volumes:
+      - ../src/atm_forecast/orchestration/data_pipeline_airflow.py:/opt/airflow/dags/data_pipeline_airflow.py:ro
+      - ../src:/opt/airflow/src:ro
+      - ../data:/opt/airflow/data
+      - ../artifacts:/opt/airflow/artifacts
+      - airflow_logs:/opt/airflow/logs
+    env_file:
+      - ../.env
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    networks:
+      - atm-network
+    profiles:
+      - airflow
+
+  airflow-scheduler:
+    image: apache/airflow:2.10.4-python3.12
+    container_name: atmosml-airflow-scheduler
+    command: airflow scheduler
+    environment:
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://atm:atm_secret@postgres:5432/atm_forecast
+      AIRFLOW__CORE__FERNET_KEY: ""
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    volumes:
+      - ../src/atm_forecast/orchestration/data_pipeline_airflow.py:/opt/airflow/dags/data_pipeline_airflow.py:ro
+      - ../src:/opt/airflow/src:ro
+      - ../data:/opt/airflow/data
+      - ../artifacts:/opt/airflow/artifacts
+      - airflow_logs:/opt/airflow/logs
+    env_file:
+      - ../.env
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - atm-network
+    profiles:
+      - airflow
+
 volumes:
   mlflow_data:
   grafana_data:
   prometheus_data:
   postgres_data:
+  airflow_logs:
 
 networks:
   atm-network:

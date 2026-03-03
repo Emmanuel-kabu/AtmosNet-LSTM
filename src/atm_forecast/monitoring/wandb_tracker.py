@@ -17,6 +17,8 @@ def init_wandb(
     tags: list[str] | None = None,
     notes: str | None = None,
     group: str | None = None,
+    entity: str | None = None,
+    api_key: str | None = None,
 ) -> Any:
     """Initialise a Weights & Biases run.
 
@@ -34,6 +36,10 @@ def init_wandb(
         Free-text description for the run.
     group : str, optional
         Group name (e.g. "experiment-v2").
+    entity : str, optional
+        W&B team / username.
+    api_key : str, optional
+        W&B API key (set as env var if provided).
 
     Returns
     -------
@@ -51,14 +57,20 @@ def init_wandb(
         )
         return None
 
+    # Set API key as env var so wandb picks it up
+    if api_key:
+        import os
+        os.environ["WANDB_API_KEY"] = api_key
+
     _wandb_run = wandb.init(
         project=project,
+        entity=entity or None,
         config=config,
         name=run_name,
         tags=tags or [],
         notes=notes,
         group=group,
-        reinit=True,
+        reinit="finish_previous",
     )
     logger.info("W&B run initialised: %s (%s)", _wandb_run.name, _wandb_run.id)
     return _wandb_run
@@ -129,7 +141,7 @@ def log_training_history(history) -> None:
 
     for epoch in range(len(history.history.get("loss", []))):
         epoch_metrics = {k: v[epoch] for k, v in history.history.items()}
-        wandb.log({"epoch": epoch, **epoch_metrics}, step=epoch)
+        wandb.log({"epoch": epoch, **epoch_metrics})
 
 
 def log_predictions(

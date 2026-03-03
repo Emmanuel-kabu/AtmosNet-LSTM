@@ -168,6 +168,127 @@ def _task_validate(**context):
     return stats
 
 
+def _task_drift_check_and_trigger(**context):
+    """Stage 5: Run drift detection and trigger Flyte CT pipeline if needed.
+
+    Uses the CTMonitor to compare current features against the training
+    reference snapshot. If data drift OR concept drift is detected (or
+    this is the first run), triggers the Flyte CT pipeline.
+
+    Trigger mechanisms (in order of preference):
+    1. Direct Python invocation via flyte.run() (local mode)
+    2. Subprocess call to ``make flyte-ct``
+    3. HTTP POST to Flyte admin API (remote clusters)
+    """
+    import json as _json
+
+    validation_stats = context["ti"].xcom_pull(
+        task_ids="validate_features", key="validation_stats"
+    )
+
+    # Skip CT trigger if validation found critical issues
+    if validation_stats and validation_stats.get("null_pct", 0) > 10.0:
+        logger.warning("Skipping CT trigger: null_pct=%.2f%% exceeds 10%%",
+                        validation_stats["null_pct"])
+        return {"triggered": False, "reason": "data_quality_too_low"}
+
+    # ── Drift detection via CTMonitor ────────────────────────────
+    try:
+        from atm_forecast.config import get_settings
+        from atm_forecast.data.lake import LAYER_FEATURES, read_all_partitions
+        from atm_forecast.monitoring.ct_monitor import CTMonitor
+
+        settings = get_settings()
+        df = read_all_partitions(settings.lake_root, LAYER_FEATURES)
+
+        ct = CTMonitor(
+            reports_dir=str(settings.evidently_reports_dir),
+            mlflow_tracking_uri=os.getenv("ATM_MLFLOW_TRACKING_URI", "http://localhost:5000"),
+            drift_threshold=float(os.getenv("ATM_DRIFT_THRESHOLD", "0.05")),
+        )
+
+        # Check if reference exists to determine first run
+        ref = ct.reference_store.load()
+        is_first_run = ref is None
+
+        result = ct.check_and_decide(
+            current_data=df,
+            is_first_run=is_first_run,
+        )
+
+        should_retrain = result.get("should_retrain", False)
+        logger.info("Drift check result: should_retrain=%s, reason=%s",
+                     should_retrain,
+                     result.get("reason", "drift_analysis"))
+
+        if not should_retrain:
+            return {
+                "triggered": False,
+                "reason": "no_drift_detected",
+                "drift_result": {
+                    k: v for k, v in result.items()
+                    if k in ("should_retrain", "data_drift", "concept_drift",
+                             "drift_check_time_s")
+                },
+            }
+
+    except Exception as exc:
+        logger.warning("Drift check failed: %s — triggering CT as safety", exc)
+        should_retrain = True
+        result = {"reason": f"drift_check_error: {exc}"}
+
+    # ── Trigger Flyte CT pipeline ────────────────────────────────
+    trigger_result = _trigger_flyte_ct()
+
+    return {
+        "triggered": True,
+        "reason": result.get("reason", "drift_detected"),
+        "trigger_result": trigger_result,
+    }
+
+
+def _trigger_flyte_ct() -> dict:
+    """Trigger the Flyte CT pipeline.
+
+    Tries direct Python invocation first, then falls back to
+    subprocess ``make flyte-ct``.
+    """
+    import subprocess
+    import sys
+
+    # Method 1: Try direct flyte.run() invocation
+    try:
+        import flyte
+        from atm_forecast.orchestration.ml_pipeline_orchestrator import ct_pipeline
+
+        flyte.init(project="atm-forecast", domain="development")
+        run_handle = flyte.run(
+            ct_pipeline,
+            models=["bilstm", "tcn", "tft"],
+            epochs=30,
+            mlflow_tracking_uri=os.getenv("ATM_MLFLOW_TRACKING_URI", "http://localhost:5000"),
+            use_wandb=os.getenv("ATM_WANDB_ENABLED", "false").lower() == "true",
+        )
+        logger.info("Flyte CT pipeline triggered via flyte.run()")
+        return {"method": "flyte_sdk", "status": "submitted"}
+    except Exception as exc:
+        logger.info("Direct flyte invocation failed: %s — trying subprocess", exc)
+
+    # Method 2: Subprocess call to make flyte-ct
+    try:
+        proc = subprocess.Popen(
+            [sys.executable, "-m", "atm_forecast.orchestration.ml_pipeline_orchestrator", "ct_pipeline"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            cwd=os.getenv("ATM_PROJECT_ROOT", "."),
+        )
+        logger.info("CT pipeline triggered via subprocess (PID=%d)", proc.pid)
+        return {"method": "subprocess", "pid": proc.pid, "status": "started"}
+    except Exception as exc:
+        logger.error("All CT trigger methods failed: %s", exc)
+        return {"method": "none", "status": "failed", "error": str(exc)}
+
+
 # =====================================================================
 # DAG definition
 # =====================================================================
@@ -176,14 +297,14 @@ with DAG(
     dag_id="atm_forecast_data_pipeline",
     default_args=default_args,
     description=(
-        "Incremental data pipeline: ingest → clean → features. "
-        "Feeds the Flyte continuous-training pipeline."
+        "Incremental data pipeline: ingest → clean → features → validate "
+        "→ drift check & CT trigger. Feeds the Flyte continuous-training pipeline."
     ),
     schedule=SCHEDULE,
     start_date=datetime(2026, 1, 1),
     catchup=False,
     max_active_runs=1,
-    tags=["atm-forecast", "data-pipeline", "etl"],
+    tags=["atm-forecast", "data-pipeline", "etl", "continuous-training"],
 ) as dag:
 
     ingest = PythonOperator(
@@ -210,5 +331,15 @@ with DAG(
         doc_md="Run data-quality checks on the features layer.",
     )
 
-    # Pipeline: ingest → clean → features → validate
-    ingest >> clean >> features >> validate
+    trigger_ct = PythonOperator(
+        task_id="drift_check_and_trigger_ct",
+        python_callable=_task_drift_check_and_trigger,
+        doc_md=(
+            "Run Evidently drift detection (data + concept drift) on the "
+            "features layer. If drift is detected or this is the first run, "
+            "trigger the Flyte CT pipeline for automatic retraining."
+        ),
+    )
+
+    # Pipeline: ingest → clean → features → validate → drift check & CT trigger
+    ingest >> clean >> features >> validate >> trigger_ct
